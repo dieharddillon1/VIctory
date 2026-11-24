@@ -515,6 +515,8 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
         .map(|name| {
             let i = version.blobs.iter().position(|b| *b == name).ok_or(BLOB_NOT_FOUND)?;
             let data = std::fs::read(version.blob(i)).map_err(|e| io_error(&c.dir, &e))?;
+            #[cfg(feature = "diagnostics")]
+            tracing::debug!(container = %c.name, blob = %name, bytes = data.len(), "game save read");
             Ok((name, data))
         })
         .collect()
