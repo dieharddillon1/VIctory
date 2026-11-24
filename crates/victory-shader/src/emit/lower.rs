@@ -214,6 +214,8 @@ struct Lower<'a> {
     uniform: Vec<bool>,
     /// Per IR value: conservatively true only for group-uniform scalars.
     val_uniform: Vec<bool>,
+    /// First-lane reads under an unchanged mask in a proven single-thread suffix.
+    single_lane_reads: HashSet<Site>,
     /// Entry-block `(flat_tid, console_lane, vwave)` cached when emulating Wave64.
     wave_ids: Option<(V, V, V)>,
     /// Active `begin_guarded` nesting depth (never emit barriers while > 0).
@@ -738,6 +740,7 @@ impl<'a> Lower<'a> {
         let mut spills = HashMap::new();
         let mut uniform = Vec::new();
         let mut val_uniform = Vec::new();
+        let mut single_lane_reads = HashSet::new();
         let mut cross_block_masks = HashMap::new();
 
         if let StageIo::Cs(cs) = x.native.io {
@@ -822,6 +825,9 @@ impl<'a> Lower<'a> {
                 Wave64Mode::Wave32 | Wave64Mode::Emulate => {
                     spills = spilled_sgprs(p);
                     (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
+                    if total_threads > 32 && insts().any(|i| i.name() == "v_readfirstlane_b32") {
+                        single_lane_reads = super::single_lane::first_lane_reads(p, x.st, x.io, cs.threads);
+                    }
                     let has_non_uniform_firstlane = insts().any(|i| {
                         i.name() == "v_readfirstlane_b32"
                             && matches!(
@@ -994,6 +1000,7 @@ impl<'a> Lower<'a> {
             spills,
             uniform,
             val_uniform,
+            single_lane_reads,
             wave_ids: None,
             guard_depth: 0,
             cross_block_masks,
@@ -5411,6 +5418,9 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
+                if self.single_lane_reads.contains(&(b, i)) {
+                    return int(self, a);
+                }
                 let non_uniform = v.src.first().is_some_and(|op| match *op {
                     Operand::Vector { reg, .. } => inst.read(Reg::V(reg)).is_some_and(|val| {
                         !self

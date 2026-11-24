@@ -87,6 +87,7 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod single_lane;
 mod sampler;
 mod shader;
 #[cfg(windows)]
