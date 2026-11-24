@@ -1672,19 +1672,59 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
+type NtWriteVirtualMemory = unsafe extern "system" fn(
+    process: windows_sys::Win32::Foundation::HANDLE,
+    base: *mut std::ffi::c_void,
+    source: *const std::ffi::c_void,
+    len: usize,
+    written: *mut usize,
+) -> i32;
+
+/// Resolve the copy-back path once. WriteProcessMemory can query the
+/// destination pages to handle executable memory, which these writes do not
+/// need. NtWriteVirtualMemory still checks that the destination is writable.
+fn nt_write_virtual_memory() -> Option<NtWriteVirtualMemory> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+
+    static CALL: OnceLock<Option<NtWriteVirtualMemory>> = OnceLock::new();
+    *CALL.get_or_init(|| {
+        // SAFETY: ntdll is loaded and the named export has this ABI.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            let write = GetProcAddress(ntdll, c"NtWriteVirtualMemory".as_ptr().cast())?;
+            Some(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                NtWriteVirtualMemory,
+            >(write))
+        }
+    })
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if len == 0 {
+        return;
+    }
+    // SAFETY: returns the pseudo-handle for this process.
+    let process = unsafe { GetCurrentProcess() };
+    let nt_write = nt_write_virtual_memory();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        // SAFETY: the source is our mapped host copy. Both APIs check the
+        // destination in the current process.
+        let success = unsafe {
+            match nt_write {
+                Some(call) => call(process, at as _, from.cast(), n, &mut done) == 0,
+                None => WriteProcessMemory(process, at as _, from.cast(), n, &mut done) != 0,
+            }
+        };
+        success && done == n
     };
-    if len == 0 || write(dst as usize, len) {
+    if write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
@@ -2460,5 +2500,62 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod title_memory_io {
+    use super::write_mapped;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, VirtualQuery,
+    };
+
+    #[test]
+    fn copy_back_writes_on_both_sides_of_an_unmapped_page() {
+        const PAGE: usize = 4096;
+        const FIRST_SKIP: usize = 17;
+        const LAST_SKIP: usize = 23;
+        const TOTAL: usize = 3 * PAGE;
+        let mut data = vec![0xabu8; TOTAL - FIRST_SKIP - LAST_SKIP];
+        data[2 * PAGE - FIRST_SKIP..].fill(0x65);
+
+        // SAFETY: reserve our own three pages, then commit the first and last.
+        // All pointer arithmetic stays within this reservation.
+        unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            let middle = base.add(PAGE);
+            let last = base.add(2 * PAGE);
+            assert_eq!(
+                VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE),
+                base.cast()
+            );
+            assert_eq!(
+                VirtualAlloc(last.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE),
+                last.cast()
+            );
+
+            write_mapped(base.add(FIRST_SKIP), data.as_ptr(), data.len());
+
+            let first = std::slice::from_raw_parts(base, PAGE);
+            let last = std::slice::from_raw_parts(last, PAGE);
+            assert!(first[..FIRST_SKIP].iter().all(|&byte| byte == 0));
+            assert!(first[FIRST_SKIP..].iter().all(|&byte| byte == 0xab));
+            assert!(last[..PAGE - LAST_SKIP].iter().all(|&byte| byte == 0x65));
+            assert!(last[PAGE - LAST_SKIP..].iter().all(|&byte| byte == 0));
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            assert_ne!(
+                VirtualQuery(
+                    middle.cast(),
+                    &mut info,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                ),
+                0
+            );
+            assert_eq!(info.State, MEM_RESERVE);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 }
