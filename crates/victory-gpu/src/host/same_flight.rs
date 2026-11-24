@@ -8,17 +8,46 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
-const MAX_BYTES: u64 = 1 << 20;
-const MAX_PIECES: usize = 16;
-const MAX_SLOTS: usize = 24;
+struct Limits {
+    bytes: u64,
+    pieces: usize,
+    slots: usize,
+}
+
+const SMALL: Limits = Limits { bytes: 1 << 20, pieces: 16, slots: 24 };
+const WIDE: Limits = Limits { bytes: 16 << 20, pieces: 256, slots: 8 };
+// Bound the CPU send history even if every card comparison is clean.
+const HISTORY_SENDS: u64 = 128;
 
 static LEGACY_EPOCH: AtomicU64 = AtomicU64::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+fn mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_SAME_FLIGHT_READBACK").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
 pub(super) fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var_os("VICTORY_SAME_FLIGHT_READBACK").is_some_and(|v| v == "1"))
+    mode() != 0
+}
+
+fn can_defer_empty_retirement(sent: u64, retired: u64) -> bool {
+    sent.saturating_sub(retired) < HISTORY_SENDS
+}
+
+// An empty fetch observed no GPU bytes. In wide mode keep its CPU send
+// history available to earlier snapshots. A real fetch always invalidates
+// them, as does hitting the bounded retention limit.
+pub(super) fn retire_empty(sent: u64) {
+    if mode() == 2 && can_defer_empty_retirement(sent, crate::shadow::relay_retired()) {
+        return;
+    }
+    retire_legacy_history();
+    crate::shadow::relay_fetched(sent);
 }
 
 /// The caller holds the queue order lock. A legacy fetch can observe
@@ -71,12 +100,14 @@ impl Pool {
     }
 }
 
-/// Records an extra copy list for a small plan whose existing compare
-/// covers every source span. The buffer and list stay with that flight.
+/// Captures a bounded plan before its own fence. Wide mode also captures
+/// ranges without comparisons, which always require a CPU merge.
 pub(super) fn prepare(host: &Host, work: &mut CardWork, plan: &mut CardPlan) {
-    if work.snapshots.active >= MAX_SLOTS
+    let wide = mode() == 2;
+    let limits = if wide { &WIDE } else { &SMALL };
+    if work.snapshots.active >= limits.slots
         || plan.ranges.is_empty()
-        || plan.ranges.iter().any(|r| !r.compared)
+        || (!wide && plan.ranges.iter().any(|r| !r.compared))
     {
         return;
     }
@@ -90,7 +121,7 @@ pub(super) fn prepare(host: &Host, work: &mut CardWork, plan: &mut CardPlan) {
                 continue;
             }
             let next = bytes + (hi - lo) as u64;
-            if pieces.len() == MAX_PIECES || next > MAX_BYTES {
+            if pieces.len() == limits.pieces || next > limits.bytes {
                 return;
             }
             pieces.push(Piece {
@@ -111,7 +142,7 @@ pub(super) fn prepare(host: &Host, work: &mut CardWork, plan: &mut CardPlan) {
         .snapshots
         .buffers
         .pop()
-        .or_else(|| host.read_back_buffer(MAX_BYTES))
+        .or_else(|| host.read_back_buffer(limits.bytes))
     else {
         return;
     };
@@ -188,7 +219,9 @@ pub(super) fn merge(plan: &CardPlan) -> bool {
     let Some(order) = snapshot.order else {
         return false;
     };
-    if !order.still_valid(LEGACY_EPOCH.load(Ordering::Relaxed)) {
+    if !order.still_valid(LEGACY_EPOCH.load(Ordering::Relaxed))
+        || (mode() == 2 && order.sent < crate::shadow::relay_retired())
+    {
         STATS[3].fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -209,9 +242,14 @@ pub(super) fn merge(plan: &CardPlan) -> bool {
         .map(|piece| {
             let r = &plan.ranges[piece.range];
             let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
-            let flag = differs
-                .get((r.at + piece.index) as usize)
-                .is_none_or(|&d| d != 0);
+            // A range without a compare must be treated as dirty, exactly
+            // as in the ordinary post-fence fetch.
+            let flag = if r.compared {
+                differs.get((r.at + piece.index) as usize).copied()
+            } else {
+                None
+            };
+            let flag = flag != Some(0);
             (copy, r.span.first + piece.index, flag)
         })
         .collect();
@@ -283,6 +321,14 @@ mod tests {
         assert!(before.still_valid(7));
         assert!(!before.still_valid(8));
         assert!(after.still_valid(8));
+    }
+
+    #[test]
+    fn empty_compares_keep_a_bounded_send_history() {
+        assert!(can_defer_empty_retirement(10, 10));
+        assert!(can_defer_empty_retirement(137, 10));
+        assert!(!can_defer_empty_retirement(138, 10));
+        assert!(!can_defer_empty_retirement(139, 10));
     }
 
     const BYTES: u64 = 64 * 1024;

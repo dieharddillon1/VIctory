@@ -3338,8 +3338,7 @@ impl Host {
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next fetch.
             let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-            same_flight::retire_legacy_history();
-            crate::shadow::relay_fetched(*order);
+            same_flight::retire_empty(*order);
             return;
         }
         if fetch.is_none() {

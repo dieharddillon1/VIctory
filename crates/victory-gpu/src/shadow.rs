@@ -488,6 +488,11 @@ pub(crate) fn preparing(number: u64) {
 /// merged came after. Notes of sends up to it are of no use any more.
 static RELAY_FETCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Highest send number whose CPU write history can already be gone.
+pub(crate) fn relay_retired() -> u64 {
+    RELAY_FETCHED.load(Ordering::Acquire)
+}
+
 /// A fetch sent after send `number` is the oldest one that may still be
 /// merged ([`RELAY_FETCHED`]).
 pub(crate) fn relay_fetched(number: u64) {
