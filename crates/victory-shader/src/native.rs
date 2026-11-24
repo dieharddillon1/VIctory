@@ -199,7 +199,12 @@ impl NativeProgram {
         if self.stage == HwStage::Gs {
             return crate::geometry::invocation_ir(self);
         }
-        crate::ir::build(&self.patched_code(), self.wave64, self.vgprs)
+        // Compute programs whose root arguments all lie beyond the first 16
+        // user SGPRs read them through a console spill table.
+        let spilled = self.stage == HwStage::Cs
+            && !self.layout.is_empty()
+            && self.layout.iter().all(|r| self.stage.user_sgpr(r.user_data) >= 16);
+        crate::ir::build_with(&self.patched_code(), self.wave64, self.vgprs, spilled)
     }
 }
 
