@@ -1134,6 +1134,15 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            // Keep the keyboard stand-in active during unattended controller tests.
+            #[cfg(feature = "diagnostics")]
+            {
+                static KEYBOARD_PAD: LazyLock<bool> =
+                    LazyLock::new(|| std::env::var("VICTORY_KEYBOARD_PAD").as_deref() == Ok("1"));
+                if *KEYBOARD_PAD {
+                    return None;
+                }
+            }
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
