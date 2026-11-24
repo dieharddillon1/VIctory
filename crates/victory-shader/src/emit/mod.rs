@@ -1188,7 +1188,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
-        let Ok(names) = super::host::adapters() else {
+        let Ok(names) = super::host::test_adapters() else {
             eprintln!("no DXGI; skipped");
             return;
         };

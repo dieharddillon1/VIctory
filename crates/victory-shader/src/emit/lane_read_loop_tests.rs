@@ -13,7 +13,7 @@
 //! run in the console flow (`lower::CONSOLE_FLOW`) on every host. Run on
 //! every hardware adapter; each wrong lane is listed.
 
-use super::host::{Dispatch, Host, Root, View, adapters};
+use super::host::{Dispatch, Host, Root, View, test_adapters};
 use crate::native::{ComputeIo, RootParam, RootType, StageIo};
 
 /// The program for waves of `wave` lanes, one wave per group, reading
@@ -102,7 +102,7 @@ fn program(wave: u32, lane: u32, joined_latch: bool) -> crate::NativeProgram {
 /// the Agility SDK, Windows 10 offers none: the test then has nothing to
 /// run on, as in `split_tests`.)
 fn devices() -> Vec<(String, Host)> {
-    let Ok(names) = adapters() else {
+    let Ok(names) = test_adapters() else {
         eprintln!("no DXGI; skipped");
         return Vec::new();
     };

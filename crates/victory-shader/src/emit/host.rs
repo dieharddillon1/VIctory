@@ -85,6 +85,20 @@ fn description(wide: &[u16]) -> String {
     String::from_utf16_lossy(&wide[..n])
 }
 
+/// Limit a diagnostic run to the requested hardware (all adapters by default).
+#[cfg(test)]
+pub(super) fn test_adapters() -> Result<Vec<String>, String> {
+    let mut names = adapters()?;
+    if let Ok(filter) = std::env::var("VICTORY_ADAPTER")
+        && !filter.is_empty()
+    {
+        let needle = filter.to_lowercase();
+        names.retain(|name| name.to_lowercase().contains(&needle));
+        assert!(!names.is_empty(), "no hardware adapter matched {filter:?}");
+    }
+    Ok(names)
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`), or
     /// the first hardware adapter whose description holds

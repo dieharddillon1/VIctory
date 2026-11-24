@@ -4,24 +4,11 @@
 //! without 64-lane waves, programs whose lanes read only their own 32-lane
 //! half run as two host waves of 32 (see `lower::Lower::new`).
 
-use super::host::{Dispatch, Host, Root, View, adapters};
+use super::host::{Dispatch, Host, Root, View, test_adapters};
 use super::tests::{compute, emit_for};
 use crate::native::{RootParam, RootType, StageIo};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
-
-/// Limit a diagnostic run to the requested hardware (all adapters by default).
-fn test_adapters() -> Result<Vec<String>, String> {
-    let mut names = adapters()?;
-    if let Ok(filter) = std::env::var("VICTORY_ADAPTER")
-        && !filter.is_empty()
-    {
-        let needle = filter.to_lowercase();
-        names.retain(|name| name.to_lowercase().contains(&needle));
-        assert!(!names.is_empty(), "no hardware adapter matched {filter:?}");
-    }
-    Ok(names)
-}
 
 /// The wave size a DXIL container's `PSV0` requires (minimum = maximum).
 fn wave_size(dxil: &[u8]) -> Option<u32> {
