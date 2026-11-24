@@ -345,6 +345,30 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        #[cfg(feature = "diagnostics")]
+        if let Some(graphics) = g
+            && graphics.targets.NumRenderTargets > 0
+            && graphics.depth_format != DXGI_FORMAT_UNKNOWN
+            && graphics.depth.DepthEnable.as_bool()
+        {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ON.get_or_init(|| std::env::var("VICTORY_DEBUG_PS").is_ok_and(|v| v == "1")) {
+                static PIXELS: [std::sync::OnceLock<victory_shader::emit::HostShader>; 8] =
+                    [const { std::sync::OnceLock::new() }; 8];
+                let targets = graphics.targets.NumRenderTargets.min(8);
+                let ps = PIXELS[(targets - 1) as usize]
+                    .get_or_init(|| victory_shader::emit::debug_ps(targets));
+                if let Some(pipeline) = Self::make(shaders, g, Some(&ps.dxil)) {
+                    static LOG: std::sync::Once = std::sync::Once::new();
+                    LOG.call_once(|| tracing::info!("drawing depth-tested geometry with the debug pixel shader"));
+                    return Some(pipeline);
+                }
+            }
+        }
+        Self::make(shaders, g, None)
+    }
+
+    fn make(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, debug_pixel: Option<&[u8]>) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -374,7 +398,9 @@ impl HostPipeline {
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            if debug_pixel.is_none() {
+                stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            }
             stages.extend(geometry.map(|gs| (gs, D3D12_SHADER_VISIBILITY_GEOMETRY)));
             stages
         };
@@ -601,6 +627,15 @@ impl HostPipeline {
         };
         let state = g.describe();
         let depth_with_bounds = g.depth_with_bounds(host);
+        let pixel = debug_pixel.map_or_else(
+            || stages.iter()
+                .position(|(_, vis)| *vis == D3D12_SHADER_VISIBILITY_PIXEL)
+                .map_or_else(Default::default, code),
+            |bytes| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: bytes.as_ptr().cast(),
+                BytecodeLength: bytes.len(),
+            },
+        );
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `MeshStages`); a
@@ -609,18 +644,18 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh triangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&code(0)), &code_bytes(&pixel)],
                 &state,
             );
             let ms = MeshStages::new(code(0));
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms, pixel, g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
                     &name,
                 ),
                 None => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms, pixel, g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
                     &name,
                 ),
@@ -647,10 +682,6 @@ impl HostPipeline {
             });
         }
 
-        let pixel = stages
-            .iter()
-            .position(|(_, vis)| *vis == D3D12_SHADER_VISIBILITY_PIXEL)
-            .map_or_else(Default::default, code);
         let gs = stages
             .iter()
             .position(|(_, vis)| *vis == D3D12_SHADER_VISIBILITY_GEOMETRY)
@@ -687,7 +718,7 @@ impl HostPipeline {
                 .and_then(|s| s.translated())
                 .map_or(&[], |s| s.host.dxil.as_slice())
         }
-        let mut bytecodes = vec![dxil(find("vertex")), dxil(find("pixel"))];
+        let mut bytecodes = vec![dxil(find("vertex")), debug_pixel.unwrap_or_else(|| dxil(find("pixel")))];
         if geometry.is_some() {
             bytecodes.push(dxil(geometry));
         }
