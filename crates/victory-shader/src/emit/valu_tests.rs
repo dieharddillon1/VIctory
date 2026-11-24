@@ -94,7 +94,7 @@ fn build_cs(body: &[u32], lds_bytes: u32) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
-    lower_cs(&words)
+    lower_cs(&words, lds_bytes)
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
@@ -107,7 +107,7 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// Lowers `words` as a 1-thread compute program with [`build_valu_cs`]'s
 /// layout: 4 root constants in `s0..s3`, the address of a table holding a
 /// UAV in `s4`.
-fn lower_cs(words: &[u32]) -> HostShader {
+fn lower_cs(words: &[u32], lds_bytes: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -1239,7 +1239,7 @@ fn a_heap_index_past_the_heap_reads_the_guard_slot() {
         buffer_store_dword(0, 8, 0)[1],
         S_ENDPGM,
     ];
-    let shader = lower_cs(&words);
+    let shader = lower_cs(&words, 0);
     // The guard is a user-data dword of its own, past the console's.
     let guard: Vec<_> = shader
         .user_data

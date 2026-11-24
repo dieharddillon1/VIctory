@@ -84,6 +84,9 @@ enum Command {
         /// are listed as failures. Default: any wave size.
         #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
         host_lanes: Option<(u32, u32)>,
+        /// Test just these shader hashes from a game rendering log (16 hex digits each).
+        #[arg(long = "hash", value_delimiter = ',')]
+        hashes: Vec<String>,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -159,7 +162,8 @@ fn main() -> Result<()> {
             list,
             jobs,
             host_lanes,
-        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+            hashes,
+        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes, hashes),
         Command::Run {
             exe,
             unimplemented,

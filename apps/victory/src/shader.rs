@@ -43,10 +43,13 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
     let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
-            offset,
-            data: &data[offset..],
+        .filter_map(|offset| {
+            let tail = &data[offset..];
+            Container::parse(tail).ok()?;
+            // The parser has checked the DXBC length. Exclude the rest of the
+            // file so the bytes hash exactly as the runtime shader does.
+            let len = u32::from_le_bytes(tail[24..28].try_into().ok()?) as usize;
+            Some(Source::Raw { offset, data: &tail[..len] })
         });
     out.extend(raw);
     out

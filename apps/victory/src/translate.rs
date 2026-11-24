@@ -161,7 +161,14 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
     host_lanes: Option<(u32, u32)>,
+    hashes: Vec<String>,
 ) -> Result<()> {
+    let mut wanted = HashSet::new();
+    for hash in hashes {
+        anyhow::ensure!(hash.len() == 16 && hash.bytes().all(|c| c.is_ascii_hexdigit()),
+            "invalid rendering log shader hash {hash:?}; expected 16 hex digits");
+        wanted.insert(hash.to_ascii_lowercase());
+    }
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -230,7 +237,7 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            translate(job, entry.path(), &wanted, &seen, &mut t, &mut checks);
                         }
                         lock(&total).merge(t);
                     });
@@ -321,6 +328,7 @@ pub fn run(
 fn translate(
     source: &Source,
     path: &Path,
+    wanted: &HashSet<String>,
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
     checks: &mut Checks,
@@ -329,6 +337,9 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
+    if !wanted.is_empty() && !wanted.contains(&blake3::hash(&bytes).to_hex()[..16]) {
+        return;
+    }
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);

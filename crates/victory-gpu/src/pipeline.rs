@@ -112,6 +112,21 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                #[cfg(feature = "diagnostics")]
+                {
+                    static CAPTURE: OnceLock<Vec<String>> = OnceLock::new();
+                    let selected = CAPTURE.get_or_init(|| parse_shader_hashes(
+                        &std::env::var("VICTORY_CAPTURE_SHADERS").unwrap_or_default(),
+                    ));
+                    if selected.contains(&self.hash)
+                        && let Some(dir) = crate::capture::folder()
+                    {
+                        let dest = dir.join(format!("{}.dxbc", self.hash));
+                        if let Err(error) = std::fs::write(dest, &self.container) {
+                            tracing::warn!(%error, hash = %self.hash, "shader capture failed");
+                        }
+                    }
+                }
                 let done = translate(&self.container);
                 match &done {
                     Ok(t) => tracing::info!(
@@ -215,7 +230,7 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+fn parse_shader_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -226,7 +241,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
             } else {
                 tracing::warn!(
                     hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
+                    "expected a 16-digit shader hash"
                 );
                 None
             }
@@ -280,7 +295,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static WAVE64: OnceLock<Vec<&'static str>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_shader_hashes(&value)
     });
     let wave64 = WAVE64.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_WAVE64").unwrap_or_default();
@@ -567,9 +582,9 @@ mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
-        assert!(super::parse_skip_hashes(" , ").is_empty());
+        assert!(super::parse_shader_hashes(" , ").is_empty());
         assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
+            super::parse_shader_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
     }
