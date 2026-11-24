@@ -123,12 +123,23 @@ fn world_on() -> bool {
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+// The prison scene after the initial cutscene and shader-cache warmup.
+static WARM_SCENE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
-    crate::frame::observe_startup(frame, drawn.saturating_sub(before));
+    let draws = drawn.saturating_sub(before);
+    crate::frame::observe_startup(frame, draws);
+    let start = crate::frame::startup_scene();
+    if start != 0 && frame.saturating_sub(start) >= 360 && draws >= 4000
+        && WARM_SCENE.load(Relaxed) == 0 && crate::pipeline::making() == 0
+        && WARM_SCENE.compare_exchange(0, frame, Relaxed, Relaxed).is_ok()
+    {
+        tracing::info!(frame, draws, "warmed 3D comparison started");
+    }
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -147,8 +158,10 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 pub(crate) fn wanted(n: u64) -> bool {
     if crate::frame::auto_startup() {
         let scene = crate::frame::startup_scene();
-        // Two screenshots only when the bench launcher supplies no explicit frames.
-        return folder().is_some() && (listed(n) || (scene != 0 && matches!(n.saturating_sub(scene), 8 | 120)));
+        let warm = WARM_SCENE.load(std::sync::atomic::Ordering::Relaxed);
+        return folder().is_some() && (listed(n)
+            || (scene != 0 && matches!(n.checked_sub(scene), Some(8 | 120)))
+            || (warm != 0 && matches!(n.checked_sub(warm), Some(2 | 40 | 96))));
     }
     // Two frames in a row each time: the title draws to two buffers in turn,
     // and every 8th or 16th frame alone only ever showed one of them.
