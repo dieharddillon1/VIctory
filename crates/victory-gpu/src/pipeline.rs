@@ -99,6 +99,24 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+impl Shader {
+    /// Diagnostics: `VICTORY_DUMP_SHADER=<dir>|<hash>[,<hash>...]` writes the
+    /// console container and the translated DXIL of the listed shaders to
+    /// `<dir>` (local analysis only).
+    fn dump_if_asked(&self, dxil: &[u8]) {
+        let Some(spec) = std::env::var_os("VICTORY_DUMP_SHADER") else { return };
+        let spec = spec.to_string_lossy().into_owned();
+        let Some((dir, hashes)) = spec.split_once('|') else { return };
+        if !hashes.split(',').any(|h| h.trim() == self.hash) {
+            return;
+        }
+        let dir = std::path::Path::new(dir);
+        let _ = std::fs::write(dir.join(format!("{}-{}.dxbc", self.stage, self.hash)), &self.container);
+        let _ = std::fs::write(dir.join(format!("{}-{}.dxil", self.stage, self.hash)), dxil);
+    }
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -114,6 +132,10 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                #[cfg(feature = "diagnostics")]
+                if let Ok(t) = &done {
+                    self.dump_if_asked(&t.host.dxil);
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,

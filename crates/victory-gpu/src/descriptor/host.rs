@@ -402,6 +402,58 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// Makes slot `index` a raw unordered access view of `buffer` from
+    /// `offset` to the end of `len` bytes. A root UAV is a raw address with
+    /// no size, so a store past the buffer's copy faults the GPU; in a view
+    /// the hardware drops such stores instead.
+    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: offset / 4,
+                    NumElements: raw_elements(len),
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a slot of our heap and a live buffer covering the range.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                buffer,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                self.cpu(index),
+            )
+        };
+        self.keep(index, Some(buffer.clone()));
+    }
+
+    /// Makes slot `index` a raw unordered access view that drops writes and
+    /// reads zeros.
+    pub(crate) fn null_raw_uav_at(&self, index: u32) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            ..Default::default()
+        };
+        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                None::<&ID3D12Resource>,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                self.cpu(index),
+            )
+        };
+        self.keep(index, None);
+    }
+
     /// Whether this is a sampler heap.
     pub(crate) fn is_sampler(&self) -> bool {
         self.sampler
@@ -1070,6 +1122,12 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// The 4-byte elements of a raw buffer view of `len` bytes: whole elements
+/// only, at least one, at most `u32::MAX`.
+pub(crate) fn raw_elements(len: u64) -> u32 {
+    (len / 4).clamp(1, u64::from(u32::MAX)) as u32
+}
+
 /// A texture view that reads zeros with the dimension (and mip and array
 /// counts) of the title's description `words`; 2D if it names none.
 fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
@@ -1124,6 +1182,16 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_views_cover_whole_elements_of_their_copy() {
+        // Whole 4-byte elements, never past the copy's end (a root UAV had
+        // no end and a store past it faulted the GPU).
+        assert_eq!(raw_elements(4096), 1024);
+        assert_eq!(raw_elements(7), 1);
+        assert_eq!(raw_elements(0), 1);
+        assert_eq!(raw_elements(u64::MAX), u32::MAX);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

@@ -83,6 +83,8 @@ pub(crate) struct State {
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    /// Root UAVs bound as one-view tables in this list, same keys.
+    root_uav_slots: std::collections::HashMap<(usize, u64), u32>,
 }
 
 impl Drop for State {
@@ -236,6 +238,48 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Makes slot `index` of a table view of `shadow` (the title buffer's host
+/// copy from its address to the end), or a null view without one. A root
+/// SRV needs 16-byte alignment, a root UAV 4; otherwise the view reads
+/// zeros, as the root view it replaces would have been refused.
+fn bind_table_view(
+    host: &crate::descriptor::host::HostHeap,
+    index: u32,
+    shadow: &Option<(u64, std::sync::Arc<crate::shadow::Shadow>)>,
+    uav: bool,
+) {
+    let Some((a, s)) = shadow else {
+        if uav {
+            host.null_raw_uav_at(index);
+        } else {
+            host.null_raw_at(index);
+        }
+        return;
+    };
+    // SAFETY: a live buffer.
+    let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+    let offset = s.gpu(*a) - base;
+    let align = if uav { 4 } else { 16 };
+    if !offset.is_multiple_of(align) {
+        // Raw views start on whole elements; one from the aligned start
+        // would shift every access.
+        once!(
+            address = format_args!("{a:#x}"),
+            uav,
+            "a root view not on its element size reads zeros"
+        );
+        if uav {
+            host.null_raw_uav_at(index);
+        } else {
+            host.null_raw_at(index);
+        }
+    } else if uav {
+        host.raw_uav_at(index, &s.buffer, offset, s.left(*a));
+    } else {
+        host.raw_at(index, &s.buffer, offset, s.left(*a));
+    }
 }
 
 /// Largest root SRV range refreshed per bind.
@@ -710,7 +754,15 @@ impl State {
                             once!(slot, "a shader reads a root view the title did not set");
                         }
                         let address = address.filter(|&a| a != 0);
-                        if !self.root_srv_table(list, address, param, compute) {
+                        if !self.root_view_table(list, address, param, compute, false) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if kind == RootView::Uav && crate::pipeline::host::bounded_root_uavs() {
+                        // A one-view table too (#493 for SRVs): a root UAV has
+                        // no size, so a store past the copy faulted the GPU.
+                        if !self.root_view_table(list, address, param, compute, true) {
                             return false;
                         }
                         continue;
@@ -779,17 +831,19 @@ impl State {
         true
     }
 
-    /// Binds a root SRV as a one-view table (see
-    /// [`crate::pipeline::host::bounded_root_srvs`]): a raw view of the
+    /// Binds a root SRV or UAV (`uav`) as a one-view table (see
+    /// [`crate::pipeline::host::bounded_root_srvs`] and
+    /// [`crate::pipeline::host::bounded_root_uavs`]): a raw view of the
     /// title buffer's host copy from `address` to the copy's end, or a null
     /// view (no address, or no host copy). One slot per address per list.
     /// False if no dynamic slot could be had (the draw is dropped).
-    fn root_srv_table(
+    fn root_view_table(
         &mut self,
         list: &HostList,
         address: Option<u64>,
         param: u32,
         compute: bool,
+        uav: bool,
     ) -> bool {
         let Some((heap, host)) = self
             .heaps
@@ -798,42 +852,39 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
         else {
-            once!("a root SRV without a bound view heap: the draw is dropped");
+            once!("a root SRV or UAV without a bound view heap: the draw is dropped");
             return false;
         };
         let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
-        let index = match self.root_srv_slots.get(&key) {
-            Some(&index) => index,
+        let cached = if uav {
+            self.root_uav_slots.get(&key)
+        } else {
+            self.root_srv_slots.get(&key)
+        };
+        let index = match cached.copied() {
+            Some(index) => index,
             None => {
                 let Some(index) = self.take_dynamic(host, key.0, 1) else {
                     return false;
                 };
-                self.root_srv_slots.insert(key, index);
-                match &shadow {
-                    Some((a, s)) => {
-                        // SAFETY: a live buffer.
-                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                        let offset = s.gpu(*a) - base;
-                        if offset.is_multiple_of(16) {
-                            host.raw_at(index, &s.buffer, offset, s.left(*a));
-                        } else {
-                            // Raw views start on 16 bytes; one from the
-                            // aligned start would shift every read.
-                            once!(
-                                address = format_args!("{a:#x}"),
-                                "a root SRV not on 16 bytes reads zeros"
-                            );
-                            host.null_raw_at(index);
-                        }
-                    }
-                    None => host.null_raw_at(index),
+                if uav {
+                    self.root_uav_slots.insert(key, index);
+                } else {
+                    self.root_srv_slots.insert(key, index);
                 }
+                bind_table_view(host, index, &shadow, uav);
                 index
             }
         };
         if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a).min(1 << 20));
+            if uav {
+                let len = root_len(s.left(*a), RootView::Uav);
+                s.refresh(list, *a, len);
+                s.gpu_writes(list, *a, len);
+            } else {
+                s.refresh(list, *a, s.left(*a).min(1 << 20));
+            }
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
