@@ -242,8 +242,8 @@ macro_rules! once {
 
 /// Makes slot `index` of a table view of `shadow` (the title buffer's host
 /// copy from its address to the end), or a null view without one. A root
-/// SRV needs 16-byte alignment, a root UAV 4; otherwise the view reads
-/// zeros, as the root view it replaces would have been refused.
+/// Raw SRV or UAV needs a 16-byte-aligned start and at least one dword.
+/// A root address that cannot be represented by such a view reads zeros.
 fn bind_table_view(
     host: &crate::descriptor::host::HostHeap,
     index: u32,
@@ -258,17 +258,14 @@ fn bind_table_view(
         }
         return;
     };
-    // SAFETY: a live buffer.
-    let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-    let offset = s.gpu(*a) - base;
-    let align = if uav { 4 } else { 16 };
-    if !offset.is_multiple_of(align) {
-        // Raw views start on whole elements; one from the aligned start
-        // would shift every access.
+    let offset = s.offset(*a);
+    let bytes = s.left(*a);
+    if !offset.is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) || bytes < 4 {
+        // Moving the view to an aligned start would shift every access.
         once!(
             address = format_args!("{a:#x}"),
             uav,
-            "a root view not on its element size reads zeros"
+            "a root view without an aligned dword reads zeros"
         );
         if uav {
             host.null_raw_uav_at(index);
@@ -276,9 +273,9 @@ fn bind_table_view(
             host.null_raw_at(index);
         }
     } else if uav {
-        host.raw_uav_at(index, &s.buffer, offset, s.left(*a));
+        host.raw_uav_at(index, &s.buffer, offset, bytes);
     } else {
-        host.raw_at(index, &s.buffer, offset, s.left(*a));
+        host.raw_at(index, &s.buffer, offset, bytes);
     }
 }
 
@@ -2073,6 +2070,27 @@ mod tests {
         assert!(zero_va.is_multiple_of(256));
         assert!(sink_va.is_multiple_of(256));
         list.close();
+    }
+
+    #[test]
+    fn bounded_root_uav_uses_null_for_an_unaligned_buffer_offset() {
+        let Some(host) = crate::host::host() else { return };
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let alloc = Allocation::watched(64 << 10);
+        let base = alloc.addr();
+        let id = alloc.ptr as usize;
+        crate::shadow::register(id, base, 64 << 10);
+        let shadow = crate::shadow::find(base, 64 << 10).unwrap();
+
+        let _ = host.log_messages();
+        for (slot, offset) in [0x10, 4, 8, 12].into_iter().enumerate() {
+            bind_table_view(&heap, slot as u32, &Some((base + offset, shadow.clone())), true);
+            assert_eq!(host.log_messages(), None, "root offset {offset}");
+            // SAFETY: a live device and a plain query.
+            unsafe { host.device.GetDeviceRemovedReason() }
+                .unwrap_or_else(|error| panic!("root offset {offset}: {error}"));
+        }
+        crate::shadow::unregister(id, base);
     }
 
     #[test]
