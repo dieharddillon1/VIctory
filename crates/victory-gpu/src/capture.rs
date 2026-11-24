@@ -230,23 +230,63 @@ pub(crate) struct PresentCandidate {
     pub(crate) copy: std::sync::Arc<crate::resource::HostTexture>,
 }
 
-// The most recent eligible target from completed work since the last present.
-static SUBMITTED_1440P: std::sync::Mutex<Option<PresentCandidate>> = std::sync::Mutex::new(None);
+// Candidates from completed submissions since the last present. The default
+// mode keeps the last target. An explicit selection keeps first-use order.
+static SUBMITTED_1440P: std::sync::Mutex<Vec<PresentCandidate>> = std::sync::Mutex::new(Vec::new());
+
+fn parse_target(spec: &str) -> Option<(i32, usize)> {
+    let tail = spec.strip_prefix("2560x1440-f")?;
+    let (format, n) = tail.split_once('-').unwrap_or((tail, "1"));
+    let format = format.parse().ok()?;
+    let n = n.parse().ok()?;
+    (matches!(format, 28 | 29 | 87 | 91) && n > 0).then_some((format, n))
+}
+
+/// An optional named view within the displayable 1440p world buffers.
+pub(crate) fn world_target() -> Option<(i32, usize)> {
+    static TARGET: std::sync::OnceLock<Option<(i32, usize)>> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let spec = std::env::var("VICTORY_SHOW_TARGET").ok()?;
+        let target = parse_target(&spec);
+        if target.is_none() {
+            tracing::warn!(%spec, "unsupported 1440p diagnostic target");
+        }
+        target
+    })
+}
 
 pub(crate) fn present_1440p_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_1440P").is_some())
+    *ON.get_or_init(|| world_target().is_some() || std::env::var_os("VICTORY_PRESENT_1440P").is_some())
 }
 
-pub(crate) fn publish_1440p_target(copy: PresentCandidate) {
-    *SUBMITTED_1440P.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+pub(crate) fn note_candidate(candidates: &mut Vec<PresentCandidate>, candidate: PresentCandidate) {
+    if let Some((_, n)) = world_target() {
+        if candidates.len() < n && !candidates.iter().any(|c| std::sync::Arc::ptr_eq(&c.copy, &candidate.copy)) {
+            candidates.push(candidate);
+        }
+    } else {
+        candidates.clear();
+        candidates.push(candidate);
+    }
+}
+
+pub(crate) fn publish_1440p_targets(candidates: &[PresentCandidate]) {
+    let mut seen = SUBMITTED_1440P.lock().unwrap_or_else(|e| e.into_inner());
+    for candidate in candidates {
+        note_candidate(&mut seen, candidate.clone());
+    }
 }
 
 pub(crate) fn take_1440p_target() -> Option<PresentCandidate> {
     if !present_1440p_on() {
         return None;
     }
-    SUBMITTED_1440P.lock().unwrap_or_else(|e| e.into_inner()).take()
+    let mut seen = SUBMITTED_1440P.lock().unwrap_or_else(|e| e.into_inner());
+    let n = world_target().map_or(1, |(_, n)| n);
+    let selected = seen.get(n - 1).cloned();
+    seen.clear();
+    selected
 }
 
 fn dump_on() -> bool {
@@ -561,6 +601,15 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_world_target_selects_a_displayable_buffer() {
+        assert_eq!(super::parse_target("2560x1440-f28-3"), Some((28, 3)));
+        assert_eq!(super::parse_target("2560x1440-f29"), Some((29, 1)));
+        assert_eq!(super::parse_target("2560x1440-f28-0"), None);
+        assert_eq!(super::parse_target("2560x1440-f40"), None);
+        assert_eq!(super::parse_target("3840x2160-f28"), None);
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

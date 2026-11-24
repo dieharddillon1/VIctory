@@ -680,9 +680,9 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
-    /// Last eligible color target nominated during recording of this list.
+    /// Eligible color targets nominated during recording of this list.
     #[cfg(feature = "diagnostics")]
-    present_1440p: Mutex<Option<crate::capture::PresentCandidate>>,
+    present_1440p: Mutex<Vec<crate::capture::PresentCandidate>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -1077,11 +1077,13 @@ impl Host {
         if crate::capture::present_1440p_on()
             // SAFETY: a live fence of this queue.
             && unsafe { self.fence.GetCompletedValue() } >= *submitted
-            && let Some(copy) = runs.iter().rev().find_map(|list| {
-                list.present_1440p.lock().unwrap_or_else(|e| e.into_inner()).clone()
-            })
         {
-            crate::capture::publish_1440p_target(copy);
+            for list in runs {
+                let candidates = list.present_1440p.lock().unwrap_or_else(|e| e.into_inner());
+                if !candidates.is_empty() {
+                    crate::capture::publish_1440p_targets(&candidates);
+                }
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -1423,7 +1425,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
-        drop(self.present_1440p.lock().unwrap_or_else(|e| e.into_inner()).take());
+        self.present_1440p.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1456,10 +1458,11 @@ impl HostList {
             && desc.MipLevels == 1
             && desc.SampleDesc.Count == 1
             && matches!(desc.Format.0, 28 | 29 | 87 | 91)
+            && crate::capture::world_target().is_none_or(|(format, _)| desc.Format.0 == format)
             && desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
         {
-            *self.present_1440p.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(crate::capture::PresentCandidate { resource: resource as usize, copy });
+            let mut candidates = self.present_1440p.lock().unwrap_or_else(|e| e.into_inner());
+            crate::capture::note_candidate(&mut candidates, crate::capture::PresentCandidate { resource: resource as usize, copy });
         }
     }
 
