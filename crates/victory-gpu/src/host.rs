@@ -544,6 +544,25 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(name) = std::env::var("VICTORY_ADAPTER").ok().filter(|s| !s.trim().is_empty()) {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+            let wanted = name.trim().to_lowercase();
+            for index in 0.. {
+                let adapter = factory.EnumAdapters1(index).inspect_err(|_| {
+                    tracing::error!(requested = %name, "could not find requested hardware adapter");
+                })?;
+                let desc = adapter.GetDesc1()?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+                let actual = String::from_utf16_lossy(&desc.Description[..end]);
+                if actual.to_lowercase().contains(&wanted) {
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                    tracing::info!(adapter = %actual, "created host rendering device");
+                    break;
+                }
+            }
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
