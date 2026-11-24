@@ -814,6 +814,11 @@ impl State {
         }
     }
 
+    /// Whether the bound pipeline completes rectangles in a geometry stage.
+    fn rect_gs(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rect_gs)
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
         if compute {
             &self.compute
@@ -1046,7 +1051,9 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.topology == RECTANGLES;
+        // A pipeline with a rectangle geometry stage takes the title's
+        // vertices as they are.
+        let rects = self.topology == RECTANGLES && !self.rect_gs();
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
@@ -1212,7 +1219,7 @@ impl State {
             why("indexed rectangles not supported");
             return false;
         }
-        if kind == DRAW && self.topology == RECTANGLES {
+        if kind == DRAW && self.topology == RECTANGLES && !self.rect_gs() {
             let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
                 #[cfg(feature = "diagnostics")]
                 crate::pipeline::note_drop(self.pipeline as This);
