@@ -40,6 +40,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) typed_image_atomics64: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -232,9 +233,16 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         let wave64_mode = recommended_wave64_mode(&device);
         crate::shader_cache::set_wave64_mode(wave64_mode);
-        tracing::info!(?wave64_mode, "Wave64 compute lowering mode selected");
+        let typed_image_atomics64 =
+            victory_shader::emit::host::supports_typed_image_atomics64(&device);
+        tracing::info!(
+            ?wave64_mode,
+            typed_image_atomics64,
+            "Wave64 compute lowering mode selected"
+        );
         Ok(Host {
             device,
+            typed_image_atomics64,
             queue,
             fence,
             submitted: Mutex::new(0),

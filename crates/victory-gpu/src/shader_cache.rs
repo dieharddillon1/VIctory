@@ -106,10 +106,16 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let options = TranslateOptions { wave64 };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    match CACHE.get() {
+    let shader = match CACHE.get() {
         Some(cache) => cached(cache, build(), wave64, container, translate),
         None => translate(container),
+    }?;
+    if shader.needs_typed_image_atomics64()
+        && !crate::host::host().is_some_and(|gpu| gpu.typed_image_atomics64)
+    {
+        return Err("the selected GPU cannot execute 64-bit typed image atomics".into());
     }
+    Ok(shader)
 }
 
 /// The cache entry's converter: the build, the lowering mode and the

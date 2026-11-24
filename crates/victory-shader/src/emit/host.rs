@@ -62,6 +62,30 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Typed descriptor-heap atomics require both optional shader features
+/// and a typed R32G32_UINT texture UAV on the selected D3D12 device.
+pub fn supports_typed_image_atomics64(device: &ID3D12Device) -> bool {
+    let mut typed = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+    let mut heap = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+    let mut format = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT_R32G32_UINT,
+        ..Default::default()
+    };
+    let required = D3D12_FORMAT_SUPPORT1_TEXTURE2D.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+    // SAFETY: each query writes its named structure into our local storage.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS9, (&raw mut typed).cast(), size_of_val(&typed) as u32,
+        ).is_ok() && typed.AtomicInt64OnTypedResourceSupported.as_bool()
+            && device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS11, (&raw mut heap).cast(), size_of_val(&heap) as u32,
+            ).is_ok() && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+            && device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut format).cast(), size_of_val(&format) as u32,
+            ).is_ok() && format.Support1.0 & required == required
+    }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -970,6 +994,8 @@ pub enum View<'a> {
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
+    /// An R32G32_UINT texture UAV (width, height), zeroed (wide atomics).
+    Uint64TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A constant buffer of these dwords.
@@ -1108,7 +1134,7 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT.
+            // Texel words: 4 for RGBA32F, 2 for R32G32_UINT, 1 for R32_UINT.
             let footprint_as =
                 |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
@@ -1117,10 +1143,10 @@ impl Host {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: if words == 1 {
-                                    DXGI_FORMAT_R32_UINT
-                                } else {
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT
+                                Format: match words {
+                                    1 => DXGI_FORMAT_R32_UINT,
+                                    2 => DXGI_FORMAT_R32G32_UINT,
+                                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
                                 },
                                 Width: w,
                                 Height: h,
@@ -1298,25 +1324,25 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 4, rb));
                     }
-                    View::UintTextureUav(w, h) => {
+                    View::UintTextureUav(w, h) | View::Uint64TextureUav(w, h) => {
+                        let (words, format) = if matches!(*v, View::Uint64TextureUav(..)) {
+                            (2, DXGI_FORMAT_R32G32_UINT)
+                        } else {
+                            (1, DXGI_FORMAT_R32_UINT)
+                        };
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
-                            &texture_as(
-                                w,
-                                h,
-                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                DXGI_FORMAT_R32_UINT,
-                            ),
+                            &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format),
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
-                        let pitch = (w * 4).next_multiple_of(256);
+                        let pitch = (w * words * 4).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        uavs.push((t, Some((w, h)), 1, rb));
+                        uavs.push((t, Some((w, h)), words, rb));
                     }
                     View::Cbv(data) => {
                         let b = upload(data)?;

@@ -22,6 +22,10 @@ pub(crate) mod flags {
     pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const ATOMIC_TYPED64: u64 = 1 << 27;
+    pub const ATOMIC_HEAP64: u64 = 1 << 32;
+    pub const FEATURE_ATOMIC_TYPED64: u64 = 0x40_0000;
+    pub const FEATURE_ATOMIC_HEAP64: u64 = 0x1000_0000;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
 }
@@ -656,6 +660,12 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::ATOMIC_TYPED64 != 0 {
+            features |= flags::FEATURE_ATOMIC_TYPED64;
+        }
+        if self.flags & flags::ATOMIC_HEAP64 != 0 {
+            features |= flags::FEATURE_ATOMIC_HEAP64;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

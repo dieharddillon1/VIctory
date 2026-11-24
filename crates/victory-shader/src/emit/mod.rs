@@ -55,10 +55,9 @@
 //!   descriptors (1,024 world compute programs, ray-tracing material
 //!   resolves) read raw views this way.
 //!
-//! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
-//!   atomically is declared a 32-bit unsigned single-channel view; the
-//!   host's view at that index must be an R32 integer view (64-bit atomics
-//!   stop the translation). Global loads from a root SRV read it raw.
+//! * **Texture atomics** use R32 integer UAVs for 32-bit operations and
+//!   R32G32_UINT UAVs for 64-bit operations. The latter require the host
+//!   device to support both typed-resource and descriptor-heap int64 atomics.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -86,6 +85,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod image_atomic_tests;
 mod barrier_padding;
 mod lower;
 mod single_lane;
@@ -169,6 +170,19 @@ pub struct HostShader {
 }
 
 impl HostShader {
+    /// This shader needs 64-bit atomics on typed image UAVs accessed
+    /// through a descriptor heap.
+    pub fn needs_typed_image_atomics64(&self) -> bool {
+        let Ok(container) = Container::parse(&self.dxil) else {
+            return false;
+        };
+        container
+            .part(FourCC::SFI0)
+            .and_then(|part| part.data.try_into().ok())
+            .map(u64::from_le_bytes)
+            .is_some_and(|features| features & shader::flags::FEATURE_ATOMIC_TYPED64 != 0)
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
