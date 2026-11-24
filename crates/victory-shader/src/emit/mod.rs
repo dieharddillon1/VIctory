@@ -379,7 +379,21 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_mode = std::env::var_os("VICTORY_WAVE_WIDE");
+        let wide_first = wide_mode.as_deref().is_some_and(|v| v == "1");
+        // In fallback mode, keep working local-wave translations (including the
+        // particle light atlas) and only widen programs that would otherwise fail.
+        let wide_last = wide_mode.as_deref().is_some_and(|v| v == "fallback");
+        let try_wide = |deep: Option<&ir::Program>| {
+            let base = deep
+                .or_else(|| forms[1].1.as_ref().map(|f| &f.0))
+                .or_else(|| forms[0].1.as_ref().map(|f| &f.0))
+                .unwrap_or(p);
+            let again = widen(c, native, base, why);
+            report("wave-wide branches", &again);
+            again.ok().and_then(|(shader, wave)| (wave != Some(64)).then_some(shader))
+        };
+        let mut deferred_deep = None;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -401,20 +415,11 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
-                    let bases = [
-                        deep.as_ref().map(|f| &f.0),
-                        forms[1].1.as_ref().map(|f| &f.0),
-                        forms[0].1.as_ref().map(|f| &f.0),
-                        Some(p),
-                    ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
-                        report("wave-wide branches", &again);
-                        if done(&again) {
-                            return again.map(|(shader, _)| shader);
-                        }
-                    }
+                if wide_first && let Some(shader) = try_wide(deep.as_ref().map(|f| &f.0)) {
+                    return Ok(shader);
+                }
+                if wide_last {
+                    deferred_deep = deep.map(|f| f.0);
                 }
                 if strict {
                     break;
@@ -460,6 +465,9 @@ pub fn emit(
                     return local.map(|(shader, _)| shader);
                 }
             }
+        }
+        if wide_last && let Some(shader) = try_wide(deferred_deep.as_ref()) {
+            return Ok(shader);
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
