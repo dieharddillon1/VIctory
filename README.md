@@ -27,6 +27,8 @@ Tested on one machine: Windows 11, AMD RX 6700 XT.
 > Windows then resets the display driver (every monitor goes black for a
 > moment). To look further, use a diagnostics build with
 > `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
+>
+> On a multi-GPU PC, set `VICTORY_ADAPTER` to part of a hardware adapter name (for example `RTX 3090`) to select it for rendering.
 
 What each part does today and what it still needs:
 
