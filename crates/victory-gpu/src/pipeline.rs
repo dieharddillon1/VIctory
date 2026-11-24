@@ -626,6 +626,8 @@ pub(crate) fn test_compute_pipeline(
         hash,
         container: Vec::new(),
         translated,
+        #[cfg(feature = "diagnostics")]
+        wave64: OnceLock::new(),
     });
     let mut out = std::ptr::null();
     assert_eq!(
