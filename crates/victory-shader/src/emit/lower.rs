@@ -247,6 +247,8 @@ struct Lower<'a> {
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+    /// Pure wave extrema emitted before a virtual wave chooses its branch.
+    hoisted_reductions: HashMap<Value, V>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
     /// The program's constant table (the code from the first byte read
@@ -1019,6 +1021,7 @@ impl<'a> Lower<'a> {
             def_block,
             cur_ir: 0,
             sections,
+            hoisted_reductions: HashMap::new(),
             section_out,
             code_table: None,
             counters: HashMap::new(),
@@ -1589,13 +1592,84 @@ impl<'a> Lower<'a> {
         Ok(xy)
     }
 
+    /// Speculatively computes pure wave extrema before a wave-uniform branch
+    /// where different virtual waves can take different paths. The predecessor
+    /// has group convergence, so the two 32-lane halves can still exchange
+    /// their results there. Only the arm that executed the original reduction
+    /// uses the results.
+    fn hoist_wave_extrema(&mut self, b: usize) {
+        use super::wave::{Op, Shape};
+        if !self.uniform[b] {
+            return;
+        }
+        let LaneExit::Branch { when, taken, not_taken } = self.x.st.exits[b] else {
+            return;
+        };
+        if !self.x.st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
+            return;
+        }
+        for (arm, join) in [(taken, not_taken), (not_taken, taken)] {
+            let block = &self.x.p.blocks[arm];
+            if self.uniform[arm] || self.rpo[arm] <= self.rpo[b]
+                || block.preds.as_slice() != [b]
+                || self.x.st.exits[arm] != LaneExit::Jump(join)
+            {
+                continue;
+            }
+            let Some(sections) = self.sections.get(&arm) else {
+                continue;
+            };
+            let Some(select) = block.insts.first() else {
+                continue;
+            };
+            let Fields::Valu(v) = &select.fields else {
+                continue;
+            };
+            if select.name() != "v_cndmask_b32"
+                || self.x.st.guards[arm][0].is_some()
+                || v.dpp.is_some()
+                || v.sdwa.is_some()
+            {
+                continue;
+            }
+            let Some(&(_, seed)) = select.writes.first() else {
+                continue;
+            };
+            let mut extrema: Vec<_> = sections
+                .values()
+                .flat_map(|sec| &sec.shapes)
+                .filter_map(|(&value, &shape)| match shape {
+                    Shape::Active(Op::MinF | Op::MaxF, src, mask, _)
+                        if self.section_out.contains(&value)
+                            && src == seed
+                            && self.x.st.masks.get(&mask) == Some(&Bool::TRUE) =>
+                    {
+                        Some((value, shape))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if extrema.is_empty() || self.valu(select, arm, 0).is_err() {
+                continue;
+            }
+            extrema.sort_unstable_by_key(|&(value, _)| value);
+            for (value, shape) in extrema {
+                if let Ok(result) = self.shape(shape) {
+                    self.hoisted_reductions.insert(value, result);
+                }
+            }
+        }
+    }
+
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) {
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
         let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
-            let val = if self.section_out.contains(&w) {
+            let val = if let Some(&result) = self.hoisted_reductions.get(&w) {
+                Val::I32(result)
+            } else if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
                 match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
                     Ok(x) => Val::I32(x),
@@ -1908,6 +1982,7 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             if self.emulating_wave64() {
                 self.preemit_masks(Some(b));
+                self.hoist_wave_extrema(b);
             }
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
@@ -4400,6 +4475,81 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A conversion of a fixed constant-buffer load has the same input in
+    /// every active lane. In the same block under unchanged EXEC, broadcasting
+    /// its result can use the local copy without a cross-wave exchange.
+    fn first_lane_of_constant_conversion(&self, inst: &Inst, b: usize, i: usize) -> bool {
+        if self.x.st.guards[b][i].is_some() {
+            return false;
+        }
+        let Fields::Valu(first) = &inst.fields else {
+            return false;
+        };
+        let [Operand::Vector { reg, dwords: 1 }] = first.src.as_slice() else {
+            return false;
+        };
+        if first.dpp.is_some() || first.sdwa.is_some() {
+            return false;
+        }
+        let Some(value) = inst.read(Reg::V(*reg)) else {
+            return false;
+        };
+        let Some((ci, convert)) = self.x.p.blocks[b].insts[..i]
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.write(Reg::V(*reg)) == Some(value))
+        else {
+            return false;
+        };
+        if convert.name() != "v_cvt_i32_f32"
+            || self.x.st.guards[b][ci].is_some()
+            || [EXEC, EXEC + 1].iter().any(|&r| {
+                inst.read(Reg::S(r)).is_none()
+                    || inst.read(Reg::S(r)) != convert.read(Reg::S(r))
+            })
+        {
+            return false;
+        }
+        let Fields::Valu(cvt) = &convert.fields else {
+            return false;
+        };
+        let [Operand::Scalar { code, dwords: 1 }] = cvt.src.as_slice() else {
+            return false;
+        };
+        (cvt.dpp.is_none() && cvt.sdwa.is_none())
+            && convert
+                .read(Reg::S(*code))
+                .and_then(|v| self.constant_buffer_value(v))
+                .is_some()
+    }
+
+    fn constant_buffer_value(&self, value: Value) -> Option<()> {
+        let &b = self.def_block.get(&value)?;
+        let (i, load) = self.x.p.blocks[b].insts.iter().enumerate().find(|(_, inst)| {
+            inst.writes.iter().any(|w| w.1 == value)
+        })?;
+        let Fields::Smem {
+            soffset: Operand::Scalar { code: NULL, .. },
+            ..
+        } = &load.fields else {
+            return None;
+        };
+        if !load.name().starts_with("s_buffer_load_dword") {
+            return None;
+        }
+        let src = self.descriptors.get(&((b, i), false))?;
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let address = self.scalar.get(load)?;
+        let resource = self.used_kind(src)?;
+        (address.dynamic.is_none()
+            && address.offset.is_multiple_of(4)
+            && Some(resource.table_offset_dwords) == (address.offset / 4).checked_add(u32::from(*first))
+            && resource.kind == ResourceType::Cbv)
+            .then_some(())
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -5432,6 +5582,9 @@ impl<'a> Lower<'a> {
                     _ => false,
                 });
                 if self.emulating_wave64() && (self.console_lanes || non_uniform) {
+                    if self.first_lane_of_constant_conversion(inst, b, i) {
+                        return int(self, a);
+                    }
                     self.cross_lane(false)?;
                     let r = self.emulated_readfirstlane(a, guard)?;
                     return int(self, r);

@@ -8,10 +8,10 @@ use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::resource::{Site, inline};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
-/// Recognizes a thread-zero marker carried through a join, then tested at the
-/// entrance to a suffix where all other threads exit. A read in that suffix
-/// under the gate's unchanged EXEC reads the thread's own value. Executing it
-/// locally avoids exchanging values between host waves after they diverge.
+/// Finds regions entered only by thread zero, while all other threads
+/// either exit or immediately skip the region's consumers at its only join.
+/// An unguarded read under the gate's unchanged EXEC reads the thread's
+/// own value without exchanging it between divergent host waves.
 pub(super) fn first_lane_reads(
     program: &Program,
     structure: &Structured,
@@ -39,20 +39,66 @@ pub(super) fn first_lane_reads(
             .is_none()
             .then_some((b, &program.blocks[b].insts[i]))
     };
-    let terminal = |b: usize| {
-        let block = &program.blocks[b];
-        block.exit == Exit::End && block.insts.iter().all(|inst| inst.name() == "s_endpgm")
+    let flat_thread_zero = |compare| {
+        let Some((id, 0)) = compare_const(compare) else {
+            return false;
+        };
+        definition(id).is_some_and(|(_, flatten)| is_flat_thread_id(flatten, io, width))
     };
     for (gate, block) in program.blocks.iter().enumerate() {
         let Some((gate_exec, entry, inactive)) = compare_branch(structure, gate) else {
             continue;
         };
-        if !terminal(inactive) {
-            continue;
-        }
         let Some((gate_def, compare)) = definition(gate_exec) else {
             continue;
         };
+        if compare.name() == "v_cmp_eq_u32" && gate_def == gate && flat_thread_zero(compare) {
+            let Some(exec) = compare_exec(program, gate, compare, gate_exec) else {
+                continue;
+            };
+            if terminal(program, inactive) {
+                reads.extend(
+                    region(program, gate, entry, inactive)
+                        .map(|region| region_reads(program, structure, &region, exec))
+                        .unwrap_or_default(),
+                );
+            } else {
+                // Before reading values computed under the first gate,
+                // converge and immediately reapply the same predicate.
+                let region_exit = &program.blocks[inactive];
+                let Some((again, second, end)) = compare_branch(structure, inactive) else {
+                    continue;
+                };
+                if again != gate_exec
+                    || !region_exit.insts.iter().all(|inst| match inst.name() {
+                        "s_mov_b64" => inst.write(Reg::S(EXEC)).is_some(),
+                        "s_and_saveexec_b64" | "s_cbranch_execz" | "s_cbranch_execnz" => true,
+                        _ => false,
+                    })
+                {
+                    continue;
+                }
+                let Some(second_exec) = compare_exec(program, inactive, compare, gate_exec) else {
+                    continue;
+                };
+                let Some(mut enclosed) = region(program, gate, entry, inactive) else {
+                    continue;
+                };
+                let Some(again) = region(program, inactive, second, end) else {
+                    continue;
+                };
+                let mut local_reads = region_reads(program, structure, &enclosed, exec);
+                local_reads.extend(region_reads(program, structure, &again, second_exec));
+                enclosed.extend(again);
+                if !reads_escape(program, structure, &enclosed, &local_reads) {
+                    reads.extend(local_reads);
+                }
+            }
+            continue;
+        }
+        if compare.name() != "v_cmpx_eq_u32" || !terminal(program, inactive) {
+            continue;
+        }
         let Some((marker, target)) = compare_const(compare).filter(|_| gate_def == gate) else {
             continue;
         };
@@ -96,57 +142,173 @@ pub(super) fn first_lane_reads(
         let Some((pick_def, compare)) = definition(pick_exec) else {
             continue;
         };
-        let Some((id, 0)) = compare_const(compare).filter(|_| pick_def == *pick) else {
-            continue;
-        };
-        let Some((_, flatten)) = definition(id) else {
-            continue;
-        };
-        let Some([y, shift, x]) = operands(flatten) else {
-            continue;
-        };
-        let thread_component = |o, c| {
-            reg_value(flatten, o)
-                .is_some_and(|v| io.inputs.contains(&(v, Input::ThreadIdInGroup(c))))
-        };
-        if flatten.name() != "v_lshl_add_u32"
-            || constant(shift) != Some(width.trailing_zeros())
-            || !thread_component(x, 0)
-            || !thread_component(y, 1)
-        {
-            continue;
+        if pick_def == *pick && compare.name() == "v_cmpx_eq_u32" && flat_thread_zero(compare) {
+            reads.extend(
+                region(program, gate, entry, inactive)
+                    .map(|region| region_reads(program, structure, &region, (gate_exec, gate_high)))
+                    .unwrap_or_default(),
+            );
         }
+    }
+    reads
+}
 
-        let mut suffix = HashSet::new();
-        let mut pending = vec![entry];
-        while let Some(b) = pending.pop() {
-            if !terminal(b) && suffix.insert(b) {
-                pending.extend(program.blocks[b].exit.successors());
-            }
+/// The EXEC pair formed by AND'ing the named lane compare into the live mask.
+fn compare_exec(
+    program: &Program,
+    gate: usize,
+    compare: &Inst,
+    value: Value,
+) -> Option<(Value, Value)> {
+    let Fields::Valu(cmp) = &compare.fields else {
+        return None;
+    };
+    let Some(Operand::Scalar { code, dwords: 2 }) = cmp.dst else {
+        return None;
+    };
+    let high = compare.write(Reg::S(code + 1))?;
+    let insts = &program.blocks[gate].insts;
+    let branch = insts.last()?;
+    let (lo_exec, hi_exec) = (branch.read(Reg::S(EXEC))?, branch.read(Reg::S(EXEC + 1))?);
+    insts
+        .iter()
+        .any(|inst| {
+            let Fields::Sop { src, .. } = &inst.fields else {
+                return false;
+            };
+            let [Operand::Scalar { code, dwords: 2 }] = src.as_slice() else {
+                return false;
+            };
+            inst.name() == "s_and_saveexec_b64"
+                && inst.read(Reg::S(*code)) == Some(value)
+                && inst.read(Reg::S(*code + 1)) == Some(high)
+                && inst.write(Reg::S(EXEC)) == Some(lo_exec)
+                && inst.write(Reg::S(EXEC + 1)) == Some(hi_exec)
+        })
+        .then_some((lo_exec, hi_exec))
+}
+
+fn terminal(program: &Program, b: usize) -> bool {
+    let block = &program.blocks[b];
+    block.exit == Exit::End && block.insts.iter().all(|inst| inst.name() == "s_endpgm")
+}
+
+/// Accept the lane-restricted region only when it has no other entry edges.
+/// Its only exits can reach the explicit join or immediately end.
+fn region(program: &Program, gate: usize, entry: usize, join: usize) -> Option<HashSet<usize>> {
+    let mut region = HashSet::new();
+    let mut pending = vec![entry];
+    while let Some(b) = pending.pop() {
+        if b != join && !terminal(program, b) && region.insert(b) {
+            pending.extend(program.blocks[b].exit.successors());
         }
-        if suffix.iter().any(|&b| {
-            b == gate
-                || program.blocks[b].exit == Exit::Indirect
-                || program.blocks[b]
-                    .preds
-                    .iter()
-                    .any(|p| !suffix.contains(p) && !(b == entry && *p == gate))
-        }) {
-            continue;
-        }
-        for b in suffix {
-            for (i, inst) in program.blocks[b].insts.iter().enumerate() {
-                if inst.name() == "v_readfirstlane_b32"
-                    && structure.guards[b][i].is_none()
-                    && inst.read(Reg::S(EXEC)) == Some(gate_exec)
-                    && inst.read(Reg::S(EXEC + 1)) == Some(gate_high)
-                {
-                    reads.insert((b, i));
-                }
+    }
+    if region.iter().any(|&b| {
+        b == gate
+            || program.blocks[b].exit == Exit::Indirect
+            || program.blocks[b]
+                .insts
+                .iter()
+                .any(|inst| inst.name() == "s_barrier")
+            || program.blocks[b]
+                .preds
+                .iter()
+                .any(|p| !region.contains(p) && !(b == entry && *p == gate))
+    }) {
+        return None;
+    }
+    Some(region)
+}
+
+fn region_reads(
+    program: &Program,
+    structure: &Structured,
+    region: &HashSet<usize>,
+    (exec, exec_hi): (Value, Value),
+) -> Vec<Site> {
+    let mut reads = Vec::new();
+    for &b in region {
+        for (i, inst) in program.blocks[b].insts.iter().enumerate() {
+            if inst.name() == "v_readfirstlane_b32"
+                && operands(inst).is_some()
+                && structure.guards[b][i].is_none()
+                && inst.read(Reg::S(EXEC)) == Some(exec)
+                && inst.read(Reg::S(EXEC + 1)) == Some(exec_hi)
+            {
+                reads.push((b, i));
             }
         }
     }
     reads
+}
+
+/// A first-lane result may cross the connecting phi, so follow its users
+/// through both gated regions. Any actual use in the shared suffix would
+/// rely on lanes that did not run the replacement.
+fn reads_escape(
+    program: &Program,
+    structure: &Structured,
+    enclosed: &HashSet<usize>,
+    reads: &[Site],
+) -> bool {
+    let mut dependent: HashSet<_> = reads
+        .iter()
+        .flat_map(|&(b, i)| program.blocks[b].insts[i].writes.iter().map(|w| w.1))
+        .collect();
+    let mut changed = !dependent.is_empty();
+    while changed {
+        changed = false;
+        for (b, block) in program.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                if phi.args.iter().any(|v| dependent.contains(v)) {
+                    changed |= dependent.insert(phi.value);
+                }
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                let used = inst.reads.iter().any(|&(reg, value)| {
+                    dependent.contains(&value)
+                        && !overwritten_vector(inst, reg, structure.guards[b][i].is_none())
+                });
+                if !used {
+                    continue;
+                }
+                if !enclosed.contains(&b) {
+                    return true;
+                }
+                for &(_, value) in &inst.writes {
+                    changed |= dependent.insert(value);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The IR preserves an old destination for possibly guarded writes. A full
+/// move from a different register does not actually consume that old value.
+fn overwritten_vector(inst: &Inst, reg: Reg, unguarded: bool) -> bool {
+    let (Reg::V(reg), Fields::Valu(v)) = (reg, &inst.fields) else {
+        return false;
+    };
+    inst.name() == "v_mov_b32"
+        && unguarded
+        && v.dpp.is_none()
+        && v.sdwa.is_none()
+        && matches!(v.dst, Some(Operand::Vector { reg: r, dwords: 1 }) if r == reg)
+        && !matches!(v.src.as_slice(), [Operand::Vector { reg: r, .. }] if *r == reg)
+}
+
+fn is_flat_thread_id(flatten: &Inst, io: &Io, width: u32) -> bool {
+    let Some([y, shift, x]) = operands(flatten) else {
+        return false;
+    };
+    let thread_component = |o, c| {
+        reg_value(flatten, o).is_some_and(|v| io.inputs.contains(&(v, Input::ThreadIdInGroup(c))))
+    };
+    flatten.name() == "v_lshl_add_u32"
+        && constant(shift) == Some(width.trailing_zeros())
+        && thread_component(x, 0)
+        && thread_component(y, 1)
 }
 
 /// The positive and negative destinations of one proven per-lane compare.
@@ -167,9 +329,6 @@ fn compare_branch(s: &Structured, b: usize) -> Option<(Value, usize, usize)> {
 }
 
 fn compare_const(inst: &Inst) -> Option<(Value, u32)> {
-    if inst.name() != "v_cmpx_eq_u32" {
-        return None;
-    }
     let [a, b] = operands(inst)? else { return None };
     reg_value(inst, a)
         .zip(constant(b))
@@ -233,6 +392,10 @@ mod tests {
             0xbf81_0000, // s_endpgm
             0xbf81_0000, // inactive: s_endpgm
         ]);
+        analyze_words(&words, threads)
+    }
+
+    fn analyze_words(words: &[u32], threads: [u32; 3]) -> HashSet<Site> {
         let code = words
             .iter()
             .flat_map(|w| w.to_le_bytes())
@@ -251,6 +414,44 @@ mod tests {
             ..Io::default()
         };
         first_lane_reads(&program, &structured, &io, threads)
+    }
+
+    fn direct_retest(shared_use: bool) -> HashSet<Site> {
+        let shared = if shared_use {
+            0x7e08_0303 // v_mov_b32 v4, v3: consumes the marked arm's value
+        } else {
+            0x7e06_0280 // v_mov_b32 v3, 0: overwrites it in every lane
+        };
+        analyze_words(
+            &[
+                0xd746_0002,
+                0x0401_0901, // v_lshl_add_u32 v2, v1, 4, v0
+                0xd4c2_0000,
+                0x0002_0480, // v_cmp_eq_u32 s[0:1], 0, v2
+                0xbe82_2400, // s_and_saveexec_b64 s[2:3], s[0:1]
+                0xbf88_0002, // s_cbranch_execz join
+                0x7e0c_0502, // v_readfirstlane_b32 s6, v2
+                0x7e06_0206, // v_mov_b32 v3, s6
+                0xbefe_0402, // join: s_mov_b64 exec, s[2:3]
+                0xbe84_2400, // s_and_saveexec_b64 s[4:5], s[0:1]
+                0xbf88_0001, // s_cbranch_execz common
+                0x7e08_0303, // v_mov_b32 v4, v3
+                0xbefe_0404, // common: s_mov_b64 exec, s[4:5]
+                shared,
+                0xbf81_0000, // s_endpgm
+            ],
+            [16, 16, 1],
+        )
+    }
+
+    #[test]
+    fn retest_keeps_the_value_on_the_same_thread() {
+        assert_eq!(direct_retest(false).len(), 1);
+    }
+
+    #[test]
+    fn shared_path_cannot_use_a_gated_first_lane_result() {
+        assert!(direct_retest(true).is_empty());
     }
 
     #[test]
