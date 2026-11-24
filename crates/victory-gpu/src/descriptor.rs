@@ -61,6 +61,9 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
+    /// The most recent write-watch query that this host heap has mirrored.
+    #[cfg(windows)]
+    synced: std::sync::atomic::AtomicU64,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -145,6 +148,46 @@ fn mirror(handle: u64) {
             drop(pending);
             if let Some(host) = host {
                 host.mirror(index, handle, false);
+            }
+        }
+    }
+}
+
+/// Refreshes slots copied directly in title memory, where D3D12's descriptor
+/// methods never see the write. This runs inside the host submission lock:
+/// a later submission must not change slots while an earlier one reads them.
+#[cfg(windows)]
+pub(crate) fn resync_title_writes() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // Holding the registry lock keeps every registered heap alive.
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, address) in heaps.iter() {
+        // SAFETY: a registered heap is live until it leaves this registry.
+        let heap = unsafe { &*(address as *const Heap) };
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+            continue;
+        };
+        let step = u64::from(step);
+        let end = start + u64::from(host.count().min(heap.desc.count)) * step;
+        if start == end {
+            continue;
+        }
+        let page = crate::watch::PAGE as u64;
+        let first_page = (start / page * page) as usize;
+        let end_page = (end.div_ceil(page) * page) as usize;
+        let Some((now, written)) = crate::watch::writes(first_page, end_page, true) else {
+            continue;
+        };
+        let before = heap.synced.swap(now, Relaxed);
+        for (page_number, written_at) in written {
+            if written_at <= before {
+                continue;
+            }
+            let from = (page_number as u64 * page).max(start);
+            let to = ((page_number as u64 + 1) * page).min(end);
+            for index in (from - start) / step..(to - start).div_ceil(step) {
+                host.mirror(index as u32, start + index * step, false);
             }
         }
     }
@@ -628,6 +671,8 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
+        #[cfg(windows)]
+        synced: std::sync::atomic::AtomicU64::new(0),
     });
     #[cfg(windows)]
     if visible {
@@ -762,6 +807,71 @@ mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    #[test]
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn submissions_mirror_descriptors_copied_in_title_memory() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let size = crate::watch::PAGE;
+        // SAFETY: a private, writable allocation for the title heap.
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                size,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let slot_size = increment(VIEWS_KIND).unwrap();
+        let mut handle = null;
+        assert_eq!(
+            create(
+                HeapDesc {
+                    kind: VIEWS_KIND,
+                    count: size as u32 / slot_size,
+                    flags: SHADER_VISIBLE,
+                    nodes: 1,
+                },
+                Placement {
+                    address: memory as u64,
+                    size: size as u64,
+                },
+                &mut handle,
+            ),
+            S_OK
+        );
+        let heap = heap(handle);
+        let mirrored = heap.host().unwrap();
+        let list = host.new_list().unwrap();
+        list.close();
+
+        let mut source = [0u64; 4];
+        let address = source.as_mut_ptr() as u64;
+        create_srv(null, null, std::ptr::null(), address);
+        assert_eq!(mirrored.describe_slot(0).as_deref(), Some("null"));
+        // SAFETY: each slot has exactly 32 bytes. No descriptor API sees this copy.
+        unsafe { std::ptr::copy_nonoverlapping(source.as_ptr().cast::<u8>(), memory.cast(), 32) };
+        host.execute_title(&[&list]);
+        assert_eq!(mirrored.describe_slot(0).as_deref(), Some("Shader(0, None)"));
+
+        // SAFETY: the title can clear the same writable slot directly too.
+        unsafe { std::ptr::write_bytes(memory.cast::<u8>(), 0, 32) };
+        host.execute_title(&[&list]);
+        assert_eq!(mirrored.describe_slot(0).as_deref(), Some("null"));
+        release(handle);
+        // Keep the allocation until process exit, as in the watch tests.
+        // The journal retains its page number and a reused address would
+        // make later tests see a write to an otherwise fresh allocation.
     }
 
     /// Grand Theft Auto VI places its shader-visible heap in its own memory

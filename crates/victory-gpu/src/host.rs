@@ -985,6 +985,15 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.execute_lists(runs, false);
+    }
+
+    /// Runs a title submission after reconciling directly written descriptors.
+    pub(crate) fn execute_title(&self, runs: &[&HostList]) {
+        self.execute_lists(runs, true);
+    }
+
+    fn execute_lists(&self, runs: &[&HostList], title_submission: bool) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -999,6 +1008,9 @@ impl Host {
         // page's written state is asked of the kernel once for all of them
         // (again after a step that writes title memory).
         let sweep = crate::watch::Sweep::begin();
+        if title_submission {
+            crate::descriptor::resync_title_writes();
+        }
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
