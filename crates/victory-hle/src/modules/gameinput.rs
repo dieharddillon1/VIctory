@@ -1231,10 +1231,32 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
+        if victory_gpu::frame::auto_startup() {
+            let accept = startup_accept(now, victory_gpu::frame::startup_scene() != 0);
+            return if accept { vec![0x0D] } else { Vec::new() };
+        }
         keys.iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
             .collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn startup_accept(elapsed: Duration, scene_started: bool) -> bool {
+        let ms = elapsed.as_millis();
+        !scene_started && (8_000..180_000).contains(&ms) && ms % 4_000 < 200
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn startup_accept_releases_the_button_and_stops_in_the_scene() {
+        let pulse = |ms, started| startup_accept(Duration::from_millis(ms), started);
+        assert!(!pulse(7_999, false));
+        assert!(pulse(8_000, false));
+        assert!(!pulse(8_200, false));
+        assert!(pulse(12_000, false));
+        assert!(!pulse(12_000, true));
+        assert!(!pulse(180_000, false));
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

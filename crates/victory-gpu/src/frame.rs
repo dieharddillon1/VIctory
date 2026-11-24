@@ -39,6 +39,28 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+static STARTUP_SCENE: AtomicU64 = AtomicU64::new(0);
+
+/// Frame at which unattended startup handed controls back to the player.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn startup_scene() -> u64 {
+    STARTUP_SCENE.load(Ordering::Relaxed)
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn auto_startup() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_AUTO_3D").is_some_and(|v| v == "1"))
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn observe_startup(frame: u64, draws: u64) {
+    if draws >= 500 && auto_startup() && STARTUP_SCENE.compare_exchange(0, frame, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        tracing::info!(frame, draws, "3D startup input stopped");
+    }
+}
+
 /// Device method: a frame every `length` microseconds. The period is how
 /// many intervals a frame may take to reach the display (pipeline depth),
 /// not part of the rate.

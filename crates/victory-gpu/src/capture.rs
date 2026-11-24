@@ -128,6 +128,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    crate::frame::observe_startup(frame, drawn.saturating_sub(before));
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -144,6 +145,11 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    if crate::frame::auto_startup() {
+        let scene = crate::frame::startup_scene();
+        // Two screenshots only when the bench launcher supplies no explicit frames.
+        return folder().is_some() && (listed(n) || (scene != 0 && matches!(n.saturating_sub(scene), 8 | 120)));
+    }
     // Two frames in a row each time: the title draws to two buffers in turn,
     // and every 8th or 16th frame alone only ever showed one of them.
     // Before the world, with `VICTORY_CAPTURE_WORLD` and
