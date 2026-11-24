@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -726,8 +727,10 @@ impl<'a> Lower<'a> {
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
-            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
-                && (i.name().contains("store") || i.name().contains("atomic"))
+            matches!(
+                i.fields,
+                Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. }
+            ) && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
         let mut wave64 = Wave64Mode::Native;
@@ -1089,13 +1092,62 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.load(c, at))
     }
 
-    /// A global memory load (`global_load_*`): from the program's constant
-    /// table, or from a root SRV at the address the title sets.
+    /// A global memory access (`global_load_*`, `global_store_*`): from the
+    /// program's constant table, or from a root SRV/UAV at the address the
+    /// title sets.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
-        let Fields::Flat { dst, .. } = &inst.fields else {
+        let Fields::Flat { dst, data, .. } = &inst.fields else {
             unreachable!()
         };
         let name = inst.name();
+        if let Some(rest) = name.strip_prefix("global_store_") {
+            let n = match rest {
+                "dword" => 1u32,
+                "dwordx2" => 2,
+                "dwordx3" => 3,
+                "dwordx4" => 4,
+                _ => return Err("a global memory write"),
+            };
+            let a = *self
+                .scalar
+                .get(&(b, i))
+                .ok_or("an untracked global address")?;
+            if a.param == CODE {
+                return Err("a global memory write");
+            }
+            let guard = self.guard(b, i)?;
+            let vals = self.vgprs(inst, data.as_ref().ok_or("a global store value")?, n as u8)?;
+            let c = self.cur;
+            let mut off = self.s.m.i32(a.offset);
+            if let Some(d) = a.dynamic {
+                let d = self.i32_of(d)?;
+                off = self.s.m.bin(c, Bin::Add, off, d);
+            }
+            let src = Source::Built {
+                address: a,
+                bits: 0,
+                words: [0, 0],
+            };
+            let h = self.handle((b, i), &src, false, (11 | 0x1000, 0))?;
+            let iu = self.s.m.undef(self.s.t.i32);
+            let mut args = vec![h, off, iu];
+            args.extend(&vals);
+            args.resize(3 + 4, iu);
+            args.push(self.s.m.i8((1u8 << n) - 1));
+            args.push(self.s.m.i32(4));
+            let at = self.begin_guarded(guard);
+            let void = self.s.t.void;
+            self.s.op(
+                self.cur,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &args,
+            );
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
         let rest = name
             .strip_prefix("global_load_")
             .ok_or("a global memory write")?;
@@ -1132,7 +1184,15 @@ impl<'a> Lower<'a> {
                 bits: 0,
                 words: [0, 0],
             };
-            Some(self.handle((b, i), &src, false, (11, 0))?)
+            let u = if self
+                .used_kind(&src)
+                .is_some_and(|u| u.kind == ResourceType::Uav)
+            {
+                0x1000
+            } else {
+                0
+            };
+            Some(self.handle((b, i), &src, false, (11 | u, 0))?)
         };
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {
@@ -1992,6 +2052,7 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
@@ -2001,6 +2062,7 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            root_uavs,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3994,7 +4056,21 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
-        let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
+        let root_desc = self.scalar.get(&site).copied().and_then(|a| {
+            (self.x.native.layout.get(a.param)?.root == RootType::Descriptor).then_some(
+                Source::Built {
+                    address: a,
+                    bits: 0,
+                    words: [0, 0],
+                },
+            )
+        });
+        let Some(rest) = name.strip_prefix("s_buffer_load_dword").or_else(|| {
+            root_desc
+                .is_some()
+                .then(|| name.strip_prefix("s_load_dword"))
+                .flatten()
+        }) else {
             return self.descriptor_data(inst, site);
         };
         let count = match rest {
@@ -4008,23 +4084,34 @@ impl<'a> Lower<'a> {
         let Some(Operand::Scalar { code, .. }) = *data else {
             return Err("a scalar buffer load");
         };
-        let src = self
-            .descriptors
-            .get(&(site, false))
-            .copied()
-            .ok_or("an untracked descriptor")?;
-        let kind = self.used_kind(src);
         let c = self.cur;
-        let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
-        let mut addr = self.s.m.i32(*offset as u32);
-        if let Some(x) = extra {
-            addr = self.s.m.bin(c, Bin::Add, addr, x);
-        }
-        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
-            let so = self.operand(inst, soffset)?;
-            addr = self.s.m.bin(c, Bin::Add, addr, so);
-        }
+        let (src, addr, constant) = if let Some(ref built) = root_desc {
+            let (base, extra) = self.built_offset(built)?;
+            let mut addr = self.s.m.i32(base);
+            if let Some(x) = extra {
+                addr = self.s.m.bin(c, Bin::Add, addr, x);
+            }
+            (built, addr, extra.is_none().then_some(base))
+        } else {
+            let src = self
+                .descriptors
+                .get(&(site, false))
+                .copied()
+                .ok_or("an untracked descriptor")?;
+            let (base, extra) = self.built_offset(src)?;
+            let off = (*offset as u32).wrapping_add(base);
+            let mut addr = self.s.m.i32(off);
+            if let Some(x) = extra {
+                addr = self.s.m.bin(c, Bin::Add, addr, x);
+            }
+            let has_soff = !matches!(soffset, Operand::Scalar { code: NULL, .. });
+            if has_soff {
+                let so = self.operand(inst, soffset)?;
+                addr = self.s.m.bin(c, Bin::Add, addr, so);
+            }
+            (src, addr, (!has_soff && extra.is_none()).then_some(off))
+        };
+        let kind = self.used_kind(src);
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
             // A descriptor built around a table in the code.
             for k in 0..count {
@@ -4035,8 +4122,16 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if matches!(
+            kind,
+            Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+        ) {
+            let u = if kind.is_some_and(|u| u.kind == ResourceType::Uav) {
+                0x1000
+            } else {
+                0
+            };
+            let h = self.handle(site, src, false, (11 | u, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -4057,14 +4152,6 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let h = self.handle(site, src, false, (13, 0x1_0000))?;
-        let constant = match addr {
-            V::Const(_)
-                if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
-            {
-                Some(*offset as u32)
-            }
-            _ => None,
-        };
         let mut rows: HashMap<u32, V> = HashMap::new();
         for k in 0..count {
             let x = match constant {
@@ -4647,7 +4734,12 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
-                    _ => Err("a root UAV or typed root view"),
+                    (RootType::Descriptor, Some(ResourceType::Uav) | None, p)
+                        if p == 11 | 0x1000 =>
+                    {
+                        Ok(self.s.root_uav_handle(rp.slot))
+                    }
+                    _ => Err("a typed root view"),
                 }
             }
             Source::Phi { block, args } => {
