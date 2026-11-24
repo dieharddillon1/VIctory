@@ -324,20 +324,27 @@ extern "system" fn present(
                     // SAFETY: a live host texture.
                     let d = unsafe { copy.texture.GetDesc() };
                     let _ = crate::capture::FIRST_WORLD_PRESENT.set(frame);
+                    let action = if crate::capture::capture_primary() {
+                        "capturing title output"
+                    } else {
+                        "presenting 2560x1440 world target as plane 0"
+                    };
                     tracing::info!(
                         width = d.Width,
                         height = d.Height,
                         format = d.Format.0,
-                        "VICTORY_PRESENT_1440P: presenting 2560x1440 world target as plane 0"
+                        "VIctory detected the first 1440p world target: {action}"
                     );
                 });
-                tracing::debug!(
-                    frame,
-                    original = ?resources[0].0,
-                    substitute = format_args!("{:#x}", candidate.resource),
-                    "PresentX primary substituted"
-                );
-                sources[0] = (&copy.texture, state);
+                if !crate::capture::capture_primary() {
+                    tracing::debug!(
+                        frame,
+                        original = ?resources[0].0,
+                        substitute = format_args!("{:#x}", candidate.resource),
+                        "PresentX primary substituted"
+                    );
+                    sources[0] = (&copy.texture, state);
+                }
             }
             let shown = host.present(&sources, frame);
             for &(resource, _, state) in &resources {

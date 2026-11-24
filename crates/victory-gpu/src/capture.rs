@@ -16,11 +16,11 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
-/// The first frame that actually displayed a 1440p world target.
+/// The first frame with an eligible completed 1440p world target.
 pub(crate) static FIRST_WORLD_PRESENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// In addition to absolute frame numbers, world+N selects a frame after
-/// the first 1440p substitution, independent of loading time.
+/// the first eligible 1440p world target, independent of loading time.
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<(Vec<u64>, Vec<u64>)> = std::sync::OnceLock::new();
     let (absolute, relative) = LIST.get_or_init(|| {
@@ -255,9 +255,15 @@ pub(crate) fn world_target() -> Option<(i32, usize)> {
     })
 }
 
+/// Observe the world milestone without substituting a diagnostic texture.
+pub(crate) fn capture_primary() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CAPTURE_PRIMARY").is_ok_and(|v| v == "1"))
+}
+
 pub(crate) fn present_1440p_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| world_target().is_some() || std::env::var_os("VICTORY_PRESENT_1440P").is_some())
+    *ON.get_or_init(|| capture_primary() || world_target().is_some() || std::env::var_os("VICTORY_PRESENT_1440P").is_some())
 }
 
 pub(crate) fn note_candidate(candidates: &mut Vec<PresentCandidate>, candidate: PresentCandidate) {
