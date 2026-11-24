@@ -17,7 +17,9 @@ use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, Moved, Resources, Role, Site, Source, spilled_sgprs};
+use crate::resource::{
+    Address, CODE, CodeOffsetJoin, Moved, Resources, Role, Site, Source, spilled_sgprs,
+};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
@@ -255,6 +257,8 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    /// Offsets from a shared code base, to fill after lowering the predecessors.
+    code_offset_phis: Vec<(V, &'a CodeOffsetJoin)>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -1193,6 +1197,7 @@ impl<'a> Lower<'a> {
             hoisted_reductions: HashMap::new(),
             section_out,
             code_table: None,
+            code_offset_phis: Vec::new(),
             counters: HashMap::new(),
             abort: None,
             guard_slots: [None; 2],
@@ -1342,6 +1347,18 @@ impl<'a> Lower<'a> {
         if let Some(d) = a.dynamic {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
+        }
+        if let Some((_, join)) = self
+            .x
+            .res
+            .code_offset_joins
+            .iter()
+            .find(|(site, _)| *site == (b, i))
+        {
+            let join_block = self.block[join.block].ok_or("an unreachable code table join")?;
+            let relative = self.s.m.phi(join_block, self.s.t.i32);
+            self.code_offset_phis.push((relative, join));
+            off = self.s.m.bin(c, Bin::Add, off, relative);
         }
         let h = if a.param == CODE {
             None
@@ -8565,6 +8582,19 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        // Resolve these first so any ordinary value phi used by an offset
+        // is marked live before the main data phi pass.
+        for (phi, join) in std::mem::take(&mut self.code_offset_phis) {
+            let block = &p.blocks[join.block];
+            let mut incoming = Vec::new();
+            for (&q, &value) in block.preds.iter().zip(&join.offsets) {
+                let Some(tail) = self.tail[q] else { continue };
+                let label = self.edges.get(&(q, join.block)).copied().unwrap_or(tail);
+                let value = self.i32_of(value).map_err(|why| unsupported(block.offset, why))?;
+                incoming.push((value, label));
+            }
+            self.s.m.set_phi(phi, incoming);
+        }
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;

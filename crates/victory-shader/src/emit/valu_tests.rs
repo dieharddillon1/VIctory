@@ -218,6 +218,83 @@ fn run_cases(
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// A code table with two dword pairs selected by the first root constant.
+fn code_table_join_words() -> Vec<u32> {
+    const VCC: u32 = 106;
+    let add_address = [
+        0xD70F_6A01, // v_add_co_u32 v1, vcc_lo, v3, s6
+        259 | 6 << 9,
+        0xD528_6A02, // v_add_co_ci_u32 v2, vcc_lo, 0, s7, vcc_lo
+        128 | 7 << 9 | VCC << 18,
+    ];
+    let mut words = vec![s_mov_b32(5, 128)];
+    words.extend(s_load_dwordx4(8, 4));
+    words.extend([
+        0xBE86_1F00, // s_getpc_b64 s[6:7]
+        sop2(0, 6, 6, 255), // s_add_u32 s6, s6, table displacement
+        0, // replaced below
+        sop2(4, 7, 7, 128), // s_addc_u32 s7, s7, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0006, // s_cbranch_scc1: skip the first address arm
+        vop1(1, 3, 128), // offset 0 for nonzero s0
+    ]);
+    words.extend(add_address);
+    words.extend([
+        0xBF82_0005, // s_branch: skip the second address arm
+        vop1(1, 3, 136), // offset 8 for zero s0
+    ]);
+    words.extend(add_address);
+    words.extend([
+        (0x37 << 26) | (0x0D << 18) | (2 << 14), // global_load_dwordx2 v[0:1], v[1:2], off
+        (125 << 16) | 1,
+        (0x1D << 25) | (1 << 9) | 256, // v_xor_b32 v0, v0, v1
+    ]);
+    words.extend(buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    // The code base is relative to the instruction after s_getpc_b64.
+    words[5] = (words.len() as u32 - 4) * 4;
+    words.extend([0xABCD_EF12, 0x3456_789A, 0x0102_0304, 0xA0B0_C0D0]);
+    words
+}
+
+#[test]
+fn code_table_offset_phi_reads_both_predecessors_on_gpu() {
+    let shader = lower_cs(&code_table_join_words());
+    let cases = [[0, 0, 0, 0], [1, 0, 0, 0]];
+    run_cases(&shader, &cases, |backend, _, input, output| {
+        let expected = if input[0] == 0 {
+            0x0102_0304 ^ 0xA0B0_C0D0
+        } else {
+            0xABCD_EF12 ^ 0x3456_789A
+        };
+        assert_eq!(output, expected, "{backend}, selector {}", input[0]);
+    });
+}
+
+#[test]
+fn code_table_offset_phi_refuses_an_unrelated_high_carry() {
+    let mut words = code_table_join_words();
+    words[19] &= !(0x1FF << 18); // second high add reads s0, not the low add's carry
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let ir = ir::build(&bytes, false, 8).unwrap();
+    let table = RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 4,
+        slot: 1,
+    };
+    let result = resource::track(&ir, &[table], HwStage::Cs);
+    assert!(matches!(
+        result,
+        Err(crate::ShaderError::Unsupported {
+            offset: 80,
+            what: "an address from a phi",
+        })
+    ), "{result:?}");
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }

@@ -94,11 +94,20 @@ pub struct Descriptor {
     pub source: Source,
 }
 
+/// Per-predecessor offsets of a code-table address, joined in `block`.
+/// Their shared constant base is the scalar access's `Address::offset`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeOffsetJoin {
+    pub block: usize,
+    pub offsets: Vec<Value>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resources {
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
+    pub code_offset_joins: Vec<(Site, CodeOffsetJoin)>,
     pub descriptors: Vec<Descriptor>,
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
@@ -185,9 +194,17 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                     offset,
                     ..
                 } if inst.name().starts_with("global_") => {
-                    let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                        .map_err(fail)?;
+                    let address =
+                        match t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset) {
+                            Ok(address) => address,
+                            Err(why) => {
+                                let (address, join) = t
+                                    .code_offset_join(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                                    .ok_or_else(|| fail(why))?;
+                                out.code_offset_joins.push((site, join));
+                                address
+                            }
+                        };
                     out.scalar.push((site, address));
                 }
                 _ => {}
@@ -558,6 +575,133 @@ impl<'a> Tracer<'a> {
                 )
             }
         }
+    }
+
+    /// A paired VGPR join at an embedded code-table read. Each predecessor
+    /// adds its own offset to the same PC-derived address with the matching
+    /// carry, and reaches the join with both halves intact.
+    fn code_offset_join(
+        &self,
+        inst: &Inst,
+        addr: Option<&Operand>,
+        saddr: Option<&Operand>,
+        offset: i16,
+    ) -> Option<(Address, CodeOffsetJoin)> {
+        if self.stage != HwStage::Cs || self.p.wave64 || inst.name() != "global_load_dwordx2" {
+            return None;
+        }
+        if !matches!(saddr, None | Some(Operand::Scalar { code: NULL, .. })) {
+            return None;
+        }
+        let Some(&Operand::Vector { reg, dwords: 2 }) = addr else {
+            return None;
+        };
+        let low = inst.read(Reg::V(reg))?;
+        let high = inst.read(Reg::V(reg.checked_add(1)?))?;
+        let (block, lo) = self.phis[low.0 as usize]?;
+        let (hi_block, hi) = self.phis[high.0 as usize]?;
+        if block != hi_block {
+            return None;
+        }
+        let block_data = &self.p.blocks[block];
+        let (low_args, high_args) = (&block_data.phis[lo].args, &block_data.phis[hi].args);
+        if low_args.len() != block_data.preds.len() || high_args.len() != block_data.preds.len() {
+            return None;
+        }
+        let lanes = self
+            .uniform_structure
+            .get_or_init(|| crate::structure::structure(self.p).ok())
+            .as_ref()?;
+        let mut base = None;
+        let mut offsets = Vec::with_capacity(low_args.len());
+        for (&lo, &hi) in low_args.iter().zip(high_args) {
+            let (edge_base, edge_offset) = self.code_offset_edge(lo, hi, lanes)?;
+            if *base.get_or_insert(edge_base) != edge_base {
+                return None;
+            }
+            offsets.push(edge_offset);
+        }
+        Some((
+            Address {
+                param: CODE,
+                offset: base?.checked_add_signed(i32::from(offset))?,
+                dynamic: None,
+            },
+            CodeOffsetJoin { block, offsets },
+        ))
+    }
+
+    fn code_offset_edge(
+        &self,
+        low: Value,
+        high: Value,
+        lanes: &crate::structure::Structured,
+    ) -> Option<(u32, Value)> {
+        let (lo, lo_fields) = self.unguarded_add(low, "v_add_co_u32", lanes)?;
+        let (hi, hi_fields) = self.unguarded_add(high, "v_add_co_ci_u32", lanes)?;
+        let [left, right] = &lo_fields.src[..] else { return None };
+        let (base, offset) = match (left, right) {
+            (base @ Operand::Scalar { .. }, Operand::Vector { reg, .. })
+            | (Operand::Vector { reg, .. }, base @ Operand::Scalar { .. }) => {
+                (self.term(lo, base)?, lo.read(Reg::V(*reg))?)
+            }
+            _ => return None,
+        };
+        let [a, b, carry] = &hi_fields.src[..] else { return None };
+        let Some(Operand::Scalar { code, .. }) = lo_fields.carry else {
+            return None;
+        };
+        if self.term(hi, carry)? != Term::Value(lo.write(Reg::S(code))?) {
+            return None;
+        }
+        let high_base = match (self.term(hi, a)?, self.term(hi, b)?) {
+            (Term::Const(0), Term::Value(base)) | (Term::Value(base), Term::Const(0)) => base,
+            _ => return None,
+        };
+        let Term::Value(low_base) = base else { return None };
+        let (add_low, [a, b]) = self.sop2(low_base, &["s_add_u32"])?;
+        let (pc_low, displacement) = match (a, b) {
+            (Term::Value(pc), Term::Const(d)) | (Term::Const(d), Term::Value(pc)) => (pc, d),
+            _ => return None,
+        };
+        let pc = self.getpc(pc_low)?;
+        let pc_high = Term::Value(pc.writes.get(1)?.1);
+        let (add_high, [a, b]) = self.sop2(high_base, &["s_addc_u32"])?;
+        if !matches!((a, b), (a, Term::Const(0)) | (Term::Const(0), a) if a == pc_high)
+            || add_high.read(Reg::Scc)? != add_low.write(Reg::Scc)?
+        {
+            return None;
+        }
+        let code_base = (pc.machine.offset as u32)
+            .checked_add(4)?
+            .checked_add(displacement)?;
+        code_base.is_multiple_of(4).then_some((code_base, offset))
+    }
+
+    fn unguarded_add(
+        &self,
+        value: Value,
+        name: &str,
+        lanes: &crate::structure::Structured,
+    ) -> Option<(&'a Inst, &'a crate::gfx10::Valu)> {
+        let (b, i) = self.defs[value.0 as usize]?;
+        let inst = self.inst((b, i));
+        let Fields::Valu(v) = &inst.fields else {
+            return None;
+        };
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return None;
+        };
+        (inst.name() == name
+            && inst.write(Reg::V(reg)) == Some(value)
+            && lanes.guards[b][i].is_none()
+            && v.abs == 0
+            && v.neg == 0
+            && v.sdwa.is_none()
+            && v.dpp.is_none()
+            && !v.clamp
+            && v.omod == 0)
+            .then_some((inst, v))
     }
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
