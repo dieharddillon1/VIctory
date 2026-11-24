@@ -1427,8 +1427,33 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
-/// What the host keeps for copies in the card's own memory
-/// ([`crate::shadow::cards`]): three lists of ours and the compare.
+/// Adjacent pieces can share a copy command when both their source and
+/// destination touch. The CPU still merges each piece independently.
+fn copy_fetch_runs<R: Copy + PartialEq>(
+    pieces: impl IntoIterator<Item = (R, usize, usize, u64)>,
+    mut copy: impl FnMut(R, usize, usize, u64),
+) -> u64 {
+    let mut pieces = pieces.into_iter().peekable();
+    let mut count = 0;
+    while let Some((source, start, mut end, at)) = pieces.next() {
+        while let Some(&(_, _, next_end, _)) = pieces.peek().filter(|&&(next, lo, _, dest)| {
+            next == source && lo == end && dest == at + (end - start) as u64
+        }) {
+            end = next_end;
+            pieces.next();
+        }
+        copy(source, start, end, at);
+        count += 1;
+    }
+    count
+}
+
+static FETCH_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+mod same_flight;
+
+/// What the host keeps for copies in the card's own memory, including
+/// the reusable lists and the compare.
 struct CardWork {
     /// Before a submission's lists: what changed on the copies' CPU side
     /// goes to their card side. Those not in use: a plan takes one and
@@ -1447,6 +1472,7 @@ struct CardWork {
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
+    snapshots: same_flight::Pool,
     /// The dwords of `differs` taken by plans whose results were not read
     /// yet.
     taken: u32,
@@ -1560,6 +1586,7 @@ struct CardPlan {
     ranges: Vec<CardRange>,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
+    snapshot: Option<same_flight::Snapshot>,
     /// The copies whose card side was brought up to date, alive until the
     /// submission has run.
     _synced: Vec<std::sync::Arc<crate::shadow::Shadow>>,
@@ -2512,6 +2539,9 @@ fn late_line(frames: f64) {
             w[WHY_FENCE],
         );
     }
+    if relay() && same_flight::enabled() {
+        same_flight::report(frames);
+    }
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -2970,6 +3000,7 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
+                snapshots: same_flight::Pool::default(),
                 taken: 0,
                 out: 0,
             })
@@ -3113,6 +3144,7 @@ impl Host {
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
+            snapshot: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
         };
@@ -3194,6 +3226,9 @@ impl Host {
             }
             plan.lists.push((true, check));
         }
+        if flown && same_flight::enabled() {
+            same_flight::prepare(self, work, &mut plan);
+        }
         work.out += 1;
         Some(plan)
     }
@@ -3218,6 +3253,9 @@ impl Host {
         let Some(work) = work.as_mut() else {
             return;
         };
+        if let Some(snapshot) = plan.snapshot {
+            work.snapshots.retire(snapshot);
+        }
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
@@ -3299,7 +3337,9 @@ impl Host {
         }
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next fetch.
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+            same_flight::retire_legacy_history();
+            crate::shadow::relay_fetched(*order);
             return;
         }
         if fetch.is_none() {
@@ -3334,6 +3374,7 @@ impl Host {
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
                 self.queue.ExecuteCommandLists(&lists);
+                same_flight::retire_legacy_history();
                 let after = *order;
                 drop(order);
                 self.card_sent();
@@ -3400,7 +3441,18 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
-                self.relay_card_back(&plans, fetch);
+                if same_flight::enabled() {
+                    // Exact snapshots land first, in queue order. A legacy
+                    // fetch can see newer data, so it must merge last.
+                    let fallback: Vec<_> = plans.iter().copied()
+                        .filter(|plan| !same_flight::merge(plan))
+                        .collect();
+                    if !fallback.is_empty() {
+                        self.relay_card_back(&fallback, fetch);
+                    }
+                } else {
+                    self.relay_card_back(&plans, fetch);
+                }
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -3993,7 +4045,7 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown);
+        let mut card = self.card_before(runs, flown);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -4002,8 +4054,12 @@ impl Host {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
+                if let Some(snapshot) = card.as_mut().and_then(|plan| plan.snapshot.as_mut()) {
+                    same_flight::execute(&self.queue, &self.fence, *submitted, &lists, snapshot)
+                } else {
+                    self.queue.ExecuteCommandLists(&lists);
+                    self.queue.Signal(&self.fence, *submitted)
+                }
             };
             self.card_sent();
             if let Err(e) = signalled {
