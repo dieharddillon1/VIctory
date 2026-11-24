@@ -14,7 +14,7 @@
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
-use crate::ir::{Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 
 /// An instruction: block and index in [`crate::ir::Block::insts`].
@@ -218,6 +218,7 @@ enum Term {
 
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
 /// optional computed term.
+#[derive(Clone, Copy)]
 struct Sum {
     base: Option<Value>,
     offset: u32,
@@ -235,6 +236,8 @@ struct Tracer<'a> {
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
+    uniform_memo: std::cell::RefCell<Vec<Option<bool>>>,
+    uniform_structure: std::cell::OnceCell<Option<crate::structure::Structured>>,
 }
 
 const MAX_ROUNDS: usize = 64;
@@ -291,6 +294,8 @@ impl<'a> Tracer<'a> {
             phis,
             inputs,
             origin: Vec::new(),
+            uniform_memo: std::cell::RefCell::new(vec![None; n]),
+            uniform_structure: std::cell::OnceCell::new(),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -558,6 +563,29 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        let first = |t| match t {
+            Term::Value(v) => self.first_lane_source(v),
+            Term::Const(_) => None,
+        };
+        let (lo_lane, hi_lane) = (first(lo), first(hi));
+        if lo_lane.is_some() || hi_lane.is_some() {
+            let candidate_lo = lo_lane.map_or(lo, |v| self.vorigin(v));
+            let candidate_hi = hi_lane.map_or(hi, |v| self.vorigin(v));
+            if let Ok(a) = self.trace_address(candidate_lo, candidate_hi, extra)
+                && a.param == CODE
+            {
+                if lo_lane.into_iter().chain(hi_lane).all(|v| self.uniform(v)) {
+                    return Ok(a);
+                }
+                return Err("an address read from the first lane of a per-lane value");
+            }
+        }
+        // A first-lane read outside the code can still supply a runtime
+        // pointer; leave it intact for the mapped title-memory path.
+        self.trace_address(lo, hi, extra)
+    }
+
+    fn trace_address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
@@ -939,6 +967,76 @@ impl<'a> Tracer<'a> {
             return None;
         };
         inst.read(Reg::V(reg))
+    }
+
+    /// Whether every lane reaching a use has the same value. A predicated
+    /// VALU write can disagree with the old value inactive lanes kept, so
+    /// only full writes are proven. Phis are outside this proof.
+    fn uniform(&self, v: Value) -> bool {
+        let n = v.0 as usize;
+        if let Some(known) = self.uniform_memo.borrow()[n] {
+            return known;
+        }
+        let known = self.uniform_now(v);
+        self.uniform_memo.borrow_mut()[n] = Some(known);
+        known
+    }
+
+    fn uniform_now(&self, v: Value) -> bool {
+        let n = v.0 as usize;
+        if let Some(reg) = self.inputs[n] {
+            return matches!(reg, Reg::S(_));
+        }
+        let Some((b, i)) = self.defs[n] else {
+            return false;
+        };
+        let inst = self.inst((b, i));
+        let name = inst.name();
+        let reads_uniform = || inst.reads.iter().all(|&(_, x)| self.uniform(x));
+        match &inst.fields {
+            Fields::Sop { .. } => reads_uniform(),
+            // A scalar load has a single address on a wave and cannot
+            // vary per lane if its address inputs are themselves uniform.
+            Fields::Smem { .. } if name.starts_with("s_load_dword") => reads_uniform(),
+            Fields::Valu(_) if name == "v_readfirstlane_b32" => true,
+            Fields::Valu(f)
+                if matches!(
+                    name,
+                    "v_mov_b32"
+                        | "v_add_co_u32"
+                        | "v_add_co_ci_u32"
+                        | "v_add_nc_u32"
+                        | "v_lshlrev_b32"
+                        | "v_lshlrev_b64"
+                        | "v_lshl_add_u32"
+                        | "v_ashrrev_i32"
+                        | "v_med3_i32"
+                        | "v_mul_u32_u24"
+                ) && f.dpp.is_none()
+                    && f.sdwa.is_none() =>
+            {
+                if self.uniform_structure
+                    .get_or_init(|| crate::structure::structure(self.p).ok())
+                    .as_ref()
+                    .is_none_or(|s| s.guards[b][i].is_some()) {
+                    return false;
+                }
+                let sources_uniform = f.src.iter().all(|op| match *op {
+                    Operand::Vector { reg, dwords } => (0..dwords)
+                        .all(|k| inst.read(Reg::V(reg + k)).is_some_and(|x| self.uniform(x))),
+                    Operand::Scalar { code, dwords } if code != NULL => (0..dwords)
+                        .all(|k| inst.read(Reg::S(code + k)).is_some_and(|x| self.uniform(x))),
+                    _ => true,
+                });
+                sources_uniform
+                    && inst.reads.iter().all(|&(reg, x)| {
+                        matches!(reg, Reg::S(code) if code == EXEC || code == EXEC + 1)
+                            || (matches!(reg, Reg::V(_)) && inst.writes.iter().any(|w| w.0 == reg))
+                            || self.uniform(x)
+                    })
+            }
+            _ => false,
+        }
     }
 
     /// The `v_readfirstlane_b32` results the descriptor operand `op` of
@@ -1701,6 +1799,118 @@ pub(crate) mod tests {
                 what: "an address in an SGPR that is no root parameter"
             }
         );
+    }
+
+    /// A scalar load of a table in the code, at an address a VGPR sum builds
+    /// from `s_getpc_b64` and a uniform index, read back to SGPRs with
+    /// `v_readfirstlane_b32` (the console compiler's form). Assembled with
+    /// llvm-mc for gfx1030, wave32.
+    const CODE_TABLE_FIRST_LANE: &[u32] = &[
+        0xBE80_1F00, // s_getpc_b64 s[0:1]
+        0x8000_FF00,
+        0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+        0x8201_8001, // s_addc_u32 s1, s1, 0
+        0x7E00_0283, // v_mov_b32 v0, 3
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD70F_6A01,
+        0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+        0xD528_6A02,
+        0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+        0x7E04_0501, // v_readfirstlane_b32 s2, v1
+        0x7E06_0502, // v_readfirstlane_b32 s3, v2
+        0xF400_0181,
+        0xFA00_0000, // s_load_dword s6, s[2:3], null
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn a_first_lane_read_of_a_uniform_code_table_address_is_traced() {
+        let r = track_words(CODE_TABLE_FIRST_LANE, &[], HwStage::Cs);
+        let (_, a) = r
+            .scalar
+            .iter()
+            .find(|s| s.1.param == CODE)
+            .expect("the code table load is traced");
+        // s_getpc_b64 is the first instruction: its next one is at 4.
+        assert_eq!(a.offset, 4 + 0xDDC);
+        assert!(a.dynamic.is_some(), "the index stays a computed term");
+    }
+
+    #[test]
+    fn a_first_lane_address_can_use_a_sign_extended_uniform_index() {
+        let mut words = CODE_TABLE_FIRST_LANE[..4].to_vec();
+        words.extend([
+            0xD558_0000,
+            133 | 130 << 9 | 135 << 18, // v_med3_i32 v0, 5, 2, 7
+            0xD746_0000,
+            256 | 130 << 9 | 256 << 18, // v_lshl_add_u32 v0, v0, 2, v0
+            0x3002_009F, // v_ashrrev_i32 v1, 31, v0
+            0xD6FF_0001,
+            0x0002_0082, // v_lshlrev_b64 v[1:2], 2, v[0:1]
+        ]);
+        words.extend_from_slice(&CODE_TABLE_FIRST_LANE[6..]);
+        let r = track_words(&words, &[], HwStage::Cs);
+        let [(_, address)] = r.scalar[..] else {
+            panic!("expected one code table load");
+        };
+        assert_eq!(address.param, CODE);
+        assert_eq!(address.offset, 4 + 0xDDC);
+        assert!(address.dynamic.is_some());
+    }
+
+    #[test]
+    fn a_first_lane_read_of_a_per_lane_code_table_address_is_refused_by_name() {
+        // Same, but the index is lane 0's own input (v0 is never set).
+        let words = [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Cs).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                // the s_load_dword, at byte 44
+                offset: 44,
+                what: "an address read from the first lane of a per-lane value"
+            }
+        );
+    }
+
+    #[test]
+    fn a_first_lane_read_of_an_index_with_a_guarded_write_is_refused() {
+        let mut words = CODE_TABLE_FIRST_LANE[..4].to_vec();
+        words.extend([
+            0x7E0E_0285, // v_mov_b32 v7, 5
+            0xBE84_037E, // s_mov_b32 s4, exec_lo
+            0x7DA4_0080, // v_cmpx_eq_u32 exec_lo, 0, v0
+            0x7E0E_0283, // v_mov_b32 v7, 3
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            0x3402_0E82, // v_lshlrev_b32 v1, 2, v7
+        ]);
+        words.extend_from_slice(&CODE_TABLE_FIRST_LANE[6..]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        assert!(matches!(
+            track(&p, &[], HwStage::Cs),
+            Err(ShaderError::Unsupported {
+                what: "an address read from the first lane of a per-lane value",
+                ..
+            })
+        ));
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the
