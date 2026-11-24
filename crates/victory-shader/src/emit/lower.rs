@@ -8373,6 +8373,24 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        // Root views are raw. Recover the byte address for an indexed
+        // access with a linear descriptor built around the root address.
+        let mut index = index;
+        if !typed
+            && let Some(element) = index
+            && let Source::Built { bits, words: [u32::MAX, 0x1101_4fac], .. } = src
+            && let Some(resource) = used
+            && resource.root == RootType::Descriptor
+            && matches!(resource.kind, ResourceType::Srv | ResourceType::Uav)
+            && resource.stride > 0
+            && resource.stride <= 0x3fff
+            && *bits == resource.stride << 16
+        {
+            let stride = self.s.m.i32(resource.stride);
+            let scaled = self.s.m.bin(c, Bin::Mul, element, stride);
+            off = self.s.m.bin(c, Bin::Add, off, scaled);
+            index = None;
+        }
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);

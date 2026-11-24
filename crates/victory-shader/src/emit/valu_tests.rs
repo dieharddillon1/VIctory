@@ -108,8 +108,12 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// layout: 4 root constants in `s0..s3`, the address of a table holding a
 /// UAV in `s4`.
 fn lower_cs(words: &[u32], lds_bytes: u32) -> HostShader {
+    lower_native_cs(&cs_program(words, lds_bytes))
+}
+
+fn cs_program(words: &[u32], lds_bytes: u32) -> NativeProgram {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
@@ -147,15 +151,17 @@ fn lower_cs(words: &[u32], lds_bytes: u32) -> HostShader {
             threads: [1, 1, 1],
         }),
         code,
-    };
+    }
+}
 
+fn lower_native_cs(native: &NativeProgram) -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -1290,14 +1296,18 @@ fn a_heap_index_past_the_heap_reads_the_guard_slot() {
 /// user data) holding `0x100 + k` in dword `k`; checks that `v0` ends up
 /// holding dword 3.
 fn reads_dword_3_through_a_root_constant_pair(body: &[u32]) {
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let shader = build_valu_cs(body);
     assert!(shader.root_srvs.is_empty());
     let [view] = shader.address_srvs[..] else {
         panic!("{:?}", shader.address_srvs)
     };
     assert_eq!((view.lo.dword, view.hi.dword), (2, 3));
-    let data: Vec<u32> = (0..8).map(|k| 0x100 + k).collect();
+    check_root_srv(&shader, 3);
+}
+
+fn check_root_srv(shader: &HostShader, expected_dword: usize) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let data: Vec<u32> = (0..32).map(|k| 0x100 + k).collect();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -1305,7 +1315,7 @@ fn reads_dword_3_through_a_root_constant_pair(body: &[u32]) {
             continue;
         };
         let (root, pso) = host
-            .compute_pipeline(&shader)
+            .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         // The constants hold an address the host does not use: it binds the
         // buffer itself.
@@ -1338,7 +1348,7 @@ fn reads_dword_3_through_a_root_constant_pair(body: &[u32]) {
                 },
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(out[0][0], data[3], "{label}: byte 12 of the buffer");
+        assert_eq!(out[0][0], data[expected_dword], "{label}: dword {expected_dword}");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
@@ -1363,4 +1373,44 @@ fn scalar_loads_through_a_root_constant_pair_read_its_root_srv() {
         0xFA00_000C,             // s_load_dword s6, s[2:3], 0xc
         vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
     ]);
+}
+
+/// Load element 2 at byte offset 4 of a root SRV with a 24-byte stride.
+#[test]
+fn indexed_root_buffer_uses_descriptor_stride_and_byte_offset() {
+    let mut words = vec![s_mov_b32(5, 128)];
+    words.extend(s_load_dwordx4(8, 4)); // output UAV
+    words.push(s_mov_b32(12, 6));
+    words.extend([0x880d_ff07, 24 << 16]); // s_or_b32 s13, s7, stride bits
+    words.push(s_mov_b32(14, 193)); // record count -1
+    words.extend([s_mov_b32(15, 255), 0x1101_4fac]);
+    words.push(vop1(0x001, 1, 130)); // index 2
+    words.extend([0xe030_2004, 0x8003_0001]); // buffer_load_dword v0, v1, s[12:15], 0 idxen offset:4
+    words.extend(buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    let mut native = cs_program(&words, 0);
+    native.layout.push(RootParam {
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        sgprs: 2,
+        base_register: 0,
+        user_data: 6,
+        slot: 2,
+    });
+    native.used.push(UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 24,
+        dwords: 4,
+        user_data: 6,
+        slot: 2,
+    });
+    if let StageIo::Cs(io) = &mut native.io {
+        io.rsrc2 = 8 << 1;
+    }
+    let shader = lower_native_cs(&native);
+    assert_eq!(shader.root_srvs, [2]);
+    check_root_srv(&shader, (2 * 24 + 4) / 4);
 }
