@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::{AddressView, UserData};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -162,6 +163,23 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
+}
+
+/// Addresses below this are taken as unset (null, or no buffer): a root SRV
+/// at an address in root constants is not bound there and its draw is
+/// dropped.
+const MIN_ADDRESS: u64 = 0x1_0000;
+
+/// The address a root SRV at an address in root constants starts at: the
+/// two constants' current values, low half first. `None` when the title has
+/// not set either or the address is below [`MIN_ADDRESS`].
+fn pair_address(roots: &[Root], view: &AddressView) -> Option<u64> {
+    let half = |u: &UserData| match roots.get(usize::from(u.slot))? {
+        Root::Constants(c) => c.get(u.dword as usize).copied(),
+        _ => None,
+    };
+    let address = u64::from(half(&view.lo)?) | u64::from(half(&view.hi)?) << 32;
+    (address >= MIN_ADDRESS).then_some(address)
 }
 
 macro_rules! once {
@@ -596,6 +614,16 @@ impl State {
                     }
                 }
             }
+            for &(view, param) in &stage.address_srvs {
+                let Some(address) = pair_address(self.roots_ref(compute), &view) else {
+                    once!(slot = view.lo.slot, dword = view.lo.dword,
+                        "a shader reads through an unset address in root constants; draw dropped");
+                    return false;
+                };
+                if !self.root_srv_table(list, Some(address), param, compute) {
+                    return false;
+                }
+            }
             if let Some(param) = stage.stride_table {
                 let gpu = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
@@ -807,6 +835,8 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -848,6 +878,16 @@ impl State {
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
                 }
+            }
+            for (view, _) in &stage.address_srvs {
+                let address = pair_address(self.roots_ref(compute), view);
+                let host =
+                    address.and_then(|a| crate::shadow::find(a, 1).map(|s| (s.gpu(a), s.left(a))));
+                let _ = write!(
+                    text,
+                    " u{}:u{}={address:#x?} host {host:#x?}",
+                    view.lo.index, view.hi.index
+                );
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
@@ -1490,4 +1530,65 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn half(slot: u8, dword: u32) -> UserData {
+        UserData {
+            index: 0,
+            slot,
+            root: RootType::Constants,
+            dword,
+        }
+    }
+
+    /// The low half at dword 1 of root parameter 0, the high half at dword 0
+    /// of parameter 2.
+    fn view() -> AddressView {
+        AddressView {
+            lo: half(0, 1),
+            hi: half(2, 0),
+        }
+    }
+
+    fn roots(lo: u32, hi: u32) -> Vec<Root> {
+        vec![
+            Root::Constants(vec![7, lo]),
+            Root::None,
+            Root::Constants(vec![hi]),
+        ]
+    }
+
+    #[test]
+    fn addresses_in_root_constants_are_composed_from_both_halves() {
+        assert_eq!(
+            pair_address(&roots(0x2345_0000, 1), &view()),
+            Some(0x1_2345_0000)
+        );
+        assert_eq!(pair_address(&roots(0x1_0000, 0), &view()), Some(0x1_0000));
+    }
+
+    #[test]
+    fn an_address_with_a_missing_half_is_unset() {
+        let set = roots(0x2345_0000, 1);
+        assert_eq!(pair_address(&set[..2], &view()), None);
+        let mut no_high = set.clone();
+        no_high[2] = Root::Constants(Vec::new());
+        assert_eq!(pair_address(&no_high, &view()), None);
+        let mut not_constants = set.clone();
+        not_constants[0] = Root::View(0x1_0000_0000);
+        assert_eq!(pair_address(&not_constants, &view()), None);
+        let mut short = set;
+        short[0] = Root::Constants(vec![7]);
+        assert_eq!(pair_address(&short, &view()), None);
+    }
+
+    #[test]
+    fn null_and_low_addresses_are_unset() {
+        assert_eq!(pair_address(&roots(0, 0), &view()), None);
+        assert_eq!(pair_address(&roots(0xFFFF, 0), &view()), None);
+    }
 }
