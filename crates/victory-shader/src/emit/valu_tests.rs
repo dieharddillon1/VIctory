@@ -237,7 +237,7 @@ fn run_cases_on(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(2)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -276,6 +276,30 @@ fn f16_to_f32(bits: u16) -> f32 {
         _ => sign | ((u32::from(exp) + 112) << 23) | (u32::from(mant) << 13),
     };
     f32::from_bits(f32_bits)
+}
+
+#[test]
+fn narrow_buffer_loads_extract_and_extend_bytes() {
+    let input = [0x80fd_017e, 0xaabb_ccfe, 0, 0];
+    // The final halfword starts at byte 3 and crosses the dword boundary.
+    for (opcode, offset, want) in [
+        (0x08u32, 2, 0x0000_00fd),
+        (0x09, 2, 0xffff_fffd),
+        (0x09, 1, 1),
+        (0x0a, 1, 0x0000_fd01),
+        (0x0a, 3, 0x0000_fe80),
+        (0x0b, 3, 0xffff_fe80),
+    ] {
+        let mut body = Vec::new();
+        body.extend(buffer_store_dword(1, 8, 0));
+        body.extend(buffer_store_dword(2, 8, 4));
+        // buffer_load_* v0, off, s[8:11], 0 offset:offset
+        body.extend([0xe000_0000 | opcode << 18 | offset, 0x8002_0000]);
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &[input], |backend, _, _, result| {
+            assert_eq!(result, want, "{backend}: opcode {opcode:#x} at {offset}");
+        });
+    }
 }
 
 #[test]

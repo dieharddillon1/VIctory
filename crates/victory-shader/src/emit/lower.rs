@@ -4271,6 +4271,53 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    fn byte_shift(&mut self, address: V) -> V {
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(self.cur, Bin::And, address, three);
+        self.s.m.bin(self.cur, Bin::Shl, byte, three)
+    }
+
+    fn read_subword(
+        &mut self,
+        address: V,
+        width: u32,
+        signed: bool,
+        dword: impl Fn(&mut Self, V) -> Result<V, Why>,
+    ) -> Result<V, Why> {
+        let c = self.cur;
+        let shift = self.byte_shift(address);
+        let not3 = self.s.m.i32(!3);
+        let aligned = self.s.m.bin(c, Bin::And, address, not3);
+        let w = dword(self, aligned)?;
+        let low = self.s.m.bin(c, Bin::LShr, w, shift);
+        let x = if width == 16 {
+            let k24 = self.s.m.i32(24);
+            let split = self.s.m.cmp(c, pred::EQ, shift, k24);
+            let at = self.begin_guarded(Some(split));
+            let four = self.s.m.i32(4);
+            let next = self.s.m.bin(self.cur, Bin::Add, aligned, four);
+            let high = dword(self, next)?;
+            let eight = self.s.m.i32(8);
+            let high = self.s.m.bin(self.cur, Bin::Shl, high, eight);
+            let both = self.s.m.bin(self.cur, Bin::Or, low, high);
+            self.end_guarded(at, &[(both, low)])[0]
+        } else {
+            low
+        };
+        let left = self.s.m.i32(32 - width);
+        let x = self.s.m.bin(self.cur, Bin::Shl, x, left);
+        Ok(self.s.m.bin(self.cur, if signed { Bin::AShr } else { Bin::LShr }, x, left))
+    }
+
+    fn raw_dword(&mut self, h: V, coords: [V; 2]) -> V {
+        let c = self.cur;
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139,
+            &[h, coords[0], coords[1], mask, align]);
+        let x = self.s.m.extract(c, r, 0);
+        self.as_int(x)
+    }
+
     /// The dword at a computed byte address of a constant buffer.
     fn cbuffer_dword(&mut self, h: V, a: V) -> V {
         let c = self.cur;
@@ -8185,6 +8232,13 @@ impl<'a> Lower<'a> {
         };
         // d16: two 16-bit channels per VGPR, low half first (buffer and
         // tbuffer formats alike).
+        let narrow = match name {
+            "buffer_load_ubyte" => Some((8, false)),
+            "buffer_load_sbyte" => Some((8, true)),
+            "buffer_load_ushort" => Some((16, false)),
+            "buffer_load_sshort" => Some((16, true)),
+            _ => None,
+        };
         let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
@@ -8192,7 +8246,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() || narrow.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -8253,6 +8307,11 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            if let Some((width, signed)) = narrow {
+                let x = self.read_subword(byte, width, signed, |l, at| Ok(l.cbuffer_dword(h, at)))?;
+                self.write(inst, Reg::V(reg), x, guard);
+                return Ok(());
+            }
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
@@ -8264,6 +8323,31 @@ impl<'a> Lower<'a> {
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
+        if let Some((width, signed)) = narrow {
+            let (h, byte, structured) = match index {
+                Some(index) => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride == 0 {
+                        let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
+                        (h, byte, None)
+                    } else if stride.is_multiple_of(4) {
+                        (self.handle(site, src, false, (12 | u, stride))?, off, Some(index))
+                    } else {
+                        return Err("an unaligned structured buffer stride");
+                    }
+                }
+                None => (self.handle(site, src, false, (11 | u, 0))?, off, None),
+            };
+            let x = self.read_subword(byte, width, signed, |l, at| {
+                let coords = structured.map_or([at, iu], |index| [index, at]);
+                Ok(l.raw_dword(h, coords))
+            })?;
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            self.write(inst, Reg::V(reg), x, guard);
+            return Ok(());
+        }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
