@@ -323,6 +323,7 @@ extern "system" fn present(
                 ONCE.call_once(|| {
                     // SAFETY: a live host texture.
                     let d = unsafe { copy.texture.GetDesc() };
+                    let _ = crate::capture::FIRST_WORLD_PRESENT.set(frame);
                     tracing::info!(
                         width = d.Width,
                         height = d.Height,

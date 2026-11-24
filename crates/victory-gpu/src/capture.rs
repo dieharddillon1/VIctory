@@ -16,17 +16,33 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
-/// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level.
+/// The first frame that actually displayed a 1440p world target.
+pub(crate) static FIRST_WORLD_PRESENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// In addition to absolute frame numbers, world+N selects a frame after
+/// the first 1440p substitution, independent of loading time.
 pub(crate) fn listed(n: u64) -> bool {
-    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
+    static LIST: std::sync::OnceLock<(Vec<u64>, Vec<u64>)> = std::sync::OnceLock::new();
+    let (absolute, relative) = LIST.get_or_init(|| {
+        let mut absolute = Vec::new();
+        let mut relative = Vec::new();
         let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
-        list.split(',')
-            .filter_map(|f| f.trim().parse().ok())
-            .collect()
-    })
-    .contains(&n)
+        for entry in list.split(',').map(str::trim) {
+            if let Some(offset) = entry.strip_prefix("world+") {
+                if let Ok(offset) = offset.parse::<u64>()
+                    && offset > 0
+                {
+                    relative.push(offset);
+                }
+            } else if let Ok(frame) = entry.parse::<u64>() {
+                absolute.push(frame);
+            }
+        }
+        (absolute, relative)
+    });
+    absolute.contains(&n) || FIRST_WORLD_PRESENT.get()
+        .and_then(|first| n.checked_sub(*first))
+        .is_some_and(|offset| relative.contains(&offset))
 }
 
 /// Whether frame `n` is saved.
