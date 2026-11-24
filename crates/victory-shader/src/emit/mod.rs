@@ -86,6 +86,7 @@ mod container;
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod barrier_padding;
 mod lower;
 mod single_lane;
 mod sampler;
@@ -333,7 +334,7 @@ pub fn emit_with(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -344,7 +345,16 @@ pub fn emit_with(
         prims,
         mesh_stride,
         options,
-    })?;
+    };
+    let l = match lower::lower(&parts) {
+        Err(e @ ShaderError::Unsupported { what, .. })
+            if options.wave64 == Wave64Mode::Wave32
+                && what == "a cross-lane wave operation in divergent control flow" =>
+        {
+            lower_with_padded_waves(&parts).unwrap_or(Err(e))?
+        }
+        other => other?,
+    };
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -366,6 +376,31 @@ pub fn emit_with(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
     })
+}
+
+/// Retry a compute program with zero-EXEC waves present for group sync.
+fn lower_with_padded_waves(parts: &lower::Parts<'_>) -> Option<Result<lower::Lowered, ShaderError>> {
+    let (native, barrier) = barrier_padding::pad(parts.native, parts.p)?;
+    let p = ir::build(&native.patched_code(), true, native.vgprs).ok()?;
+    if !barrier_padding::stays_inactive(&p, barrier) {
+        return None;
+    }
+    let st = structure::structure(&p).ok()?;
+    let io = io::raise(&p, &native).ok()?;
+    let res = resource::track(&p, &native.layout, native.stage).ok()?;
+    let padded = lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: parts.inputs.clone(),
+        outputs: parts.outputs.clone(),
+        prims: parts.prims.clone(),
+        mesh_stride: parts.mesh_stride,
+        options: parts.options,
+    };
+    lower::barriers_converge(&padded).then(|| lower::lower(&padded))
 }
 
 /// The rows of an `ISG1`/`OSG1` part.

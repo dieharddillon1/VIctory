@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::gfx10::{Fields, Operand};
 use crate::io::{Input, Io};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, M0, Program, Reg, Value};
 use crate::resource::{Site, inline};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
@@ -46,6 +46,16 @@ pub(super) fn first_lane_reads(
         definition(id).is_some_and(|(_, flatten)| is_flat_thread_id(flatten, io, width))
     };
     for (gate, block) in program.blocks.iter().enumerate() {
+        if threads[1] == 1
+            && let Some((mask, entry, join, exec)) = saved_exec_gate(block)
+            && thread_zero_mask(program, io, mask, &defs)
+            && let Some(enclosed) = region(program, gate, entry, join)
+        {
+            let local = region_reads(program, structure, &enclosed, exec);
+            if !reads_escape(program, structure, &enclosed, &local) {
+                reads.extend(local);
+            }
+        }
         let Some((gate_exec, entry, inactive)) = compare_branch(structure, gate) else {
             continue;
         };
@@ -151,6 +161,85 @@ pub(super) fn first_lane_reads(
         }
     }
     reads
+}
+
+/// A branch on the EXEC pair formed by s_and_saveexec_b64.
+fn saved_exec_gate(block: &crate::ir::Block) -> Option<([Value; 2], usize, usize, (Value, Value))> {
+    let Exit::Branch { taken, not_taken } = block.exit else {
+        return None;
+    };
+    let branch = block.insts.last()?;
+    let (entry, join) = match branch.name() {
+        "s_cbranch_execz" => (not_taken, taken),
+        "s_cbranch_execnz" => (taken, not_taken),
+        _ => return None,
+    };
+    let exec = (branch.read(Reg::S(EXEC))?, branch.read(Reg::S(EXEC + 1))?);
+    let save = block.insts.iter().find(|inst| {
+        inst.name() == "s_and_saveexec_b64"
+            && inst.write(Reg::S(EXEC)) == Some(exec.0)
+            && inst.write(Reg::S(EXEC + 1)) == Some(exec.1)
+    })?;
+    let Fields::Sop { src, .. } = &save.fields else {
+        return None;
+    };
+    let [Operand::Scalar { code, dwords: 2 }] = src.as_slice() else {
+        return None;
+    };
+    let mask = [save.read(Reg::S(*code))?, save.read(Reg::S(*code + 1))?];
+    Some((mask, entry, join, exec))
+}
+
+/// The pair of dwords of a comparison of local X against zero, or a
+/// join of that mask and empty masks left by other paths.
+fn thread_zero_mask(
+    program: &Program,
+    io: &Io,
+    mask: [Value; 2],
+    defs: &HashMap<Value, Site>,
+) -> bool {
+    let mut pending = vec![mask];
+    let mut seen = HashSet::new();
+    let mut has_leaf = false;
+    while let Some(pair @ [lo, hi]) = pending.pop() {
+        if !seen.insert(pair) {
+            continue;
+        }
+        let Some(&(b, i)) = defs.get(&lo) else {
+            let Some((a, b)) = program.blocks.iter().find_map(|block| {
+                let a = block.phis.iter().find(|phi| phi.value == lo)?;
+                let b = block.phis.iter().find(|phi| phi.value == hi)?;
+                Some((a, b))
+            }) else {
+                return false;
+            };
+            pending.extend(a.args.iter().zip(&b.args).map(|(&lo, &hi)| [lo, hi]));
+            continue;
+        };
+        let inst = &program.blocks[b].insts[i];
+        let is_thread_zero = inst.name() == "v_cmp_eq_u32"
+            && compare_const(inst).is_some_and(|(id, target)| {
+                target == 0 && io.inputs.contains(&(id, Input::ThreadIdInGroup(0)))
+            });
+        let compare_false = inst.name() == "v_cmp_eq_u32"
+            && matches!(operands(inst), Some([a,b])
+                if constant(a).zip(constant(b)).is_some_and(|(a,b)| a != b));
+        let moves_zero = inst.name() == "s_mov_b64"
+            && matches!(&inst.fields,
+            Fields::Sop { src, .. } if matches!(src.as_slice(), [source] if constant(source) == Some(0)));
+        if !(is_thread_zero || compare_false || moves_zero)
+            || inst
+                .writes
+                .get(..2)
+                .is_none_or(|w| [w[0].1, w[1].1] != pair)
+        {
+            return false;
+        }
+        // The compare's lane result intersects EXEC, including when it is
+        // predicated. A restricted compare can only remove the selected lane.
+        has_leaf = true;
+    }
+    has_leaf
 }
 
 /// The EXEC pair formed by AND'ing the named lane compare into the live mask.
@@ -268,6 +357,7 @@ fn reads_escape(
                 let used = inst.reads.iter().any(|&(reg, value)| {
                     dependent.contains(&value)
                         && !overwritten_vector(inst, reg, structure.guards[b][i].is_none())
+                        && !relative_read_outside_loop_range(program, b, i, inst, reg)
                 });
                 if !used {
                     continue;
@@ -282,6 +372,112 @@ fn reads_escape(
         }
     }
     false
+}
+
+/// The IR enumerates every possible relative VGPR source. On a proven
+/// ascending finite loop, indices outside its live range are unreachable.
+fn relative_read_outside_loop_range(
+    program: &Program,
+    b: usize,
+    i: usize,
+    inst: &Inst,
+    reg: Reg,
+) -> bool {
+    if inst.name() != "v_movrels_b32" {
+        return false;
+    }
+    let (Reg::V(reg), Fields::Valu(v)) = (reg, &inst.fields) else {
+        return false;
+    };
+    let Some(
+        [
+            Operand::Vector {
+                reg: base,
+                dwords: 1,
+            },
+        ],
+    ) = operands(inst)
+    else {
+        return false;
+    };
+    if matches!(v.dst, Some(Operand::Vector { reg: dst, .. }) if dst == reg) {
+        return false;
+    }
+    relative_loop_limit(program, b, i, inst)
+        .is_some_and(|limit| u32::from(reg) >= u32::from(*base) + limit)
+}
+
+fn relative_loop_limit(program: &Program, b: usize, i: usize, inst: &Inst) -> Option<u32> {
+    let m0 = inst.read(Reg::S(M0))?;
+    let set = program.blocks[b].insts[..i]
+        .iter()
+        .find(|inst| inst.write(Reg::S(M0)) == Some(m0))?;
+    let [Operand::Scalar { code, dwords: 1 }] = scalar_operands(set, "s_mov_b32")? else {
+        return None;
+    };
+    let reg = Reg::S(*code);
+    let counter = set.read(reg)?;
+    let (header, phi) = program.blocks.iter().enumerate().find_map(|(b, block)| {
+        block
+            .phis
+            .iter()
+            .find(|phi| phi.value == counter && phi.reg == reg)
+            .map(|phi| (b, phi))
+    })?;
+    let [entry, latch] = program.blocks[header].preds.as_slice() else {
+        return None;
+    };
+    let [initial, next] = phi.args.as_slice() else {
+        return None;
+    };
+    let init = program.blocks[*entry]
+        .insts
+        .iter()
+        .find(|inst| inst.write(reg) == Some(*initial))?;
+    let [imm] = scalar_operands(init, "s_mov_b32")? else {
+        return None;
+    };
+    if constant(imm) != Some(0) {
+        return None;
+    }
+    let latch = &program.blocks[*latch];
+    let Exit::Branch { taken, not_taken } = latch.exit else {
+        return None;
+    };
+    let branch = latch.insts.last()?;
+    if taken != header || not_taken == header || branch.name() != "s_cbranch_scc0" {
+        return None;
+    }
+    let inc = latch
+        .insts
+        .iter()
+        .find(|inst| inst.write(reg) == Some(*next))?;
+    let [Operand::Scalar { code, dwords: 1 }, step] = scalar_operands(inc, "s_add_i32")? else {
+        return None;
+    };
+    if Reg::S(*code) != reg || inc.read(reg) != Some(counter) || constant(step) != Some(1) {
+        return None;
+    }
+    let scc = branch.read(Reg::Scc)?;
+    let test = latch
+        .insts
+        .iter()
+        .find(|inst| inst.write(Reg::Scc) == Some(scc))?;
+    let [Operand::Scalar { code, dwords: 1 }, bound] = scalar_operands(test, "s_cmp_eq_u32")?
+    else {
+        return None;
+    };
+    if Reg::S(*code) != reg || test.read(reg) != Some(*next) {
+        return None;
+    }
+    constant(bound).filter(|limit| (1..=256).contains(limit))
+}
+
+fn scalar_operands<'a>(inst: &'a Inst, name: &str) -> Option<&'a [Operand]> {
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    (inst.name() == name).then_some(src)
 }
 
 /// The IR preserves an old destination for possibly guarded writes. A full

@@ -493,6 +493,13 @@ fn compute_postdoms(n: usize, succs: &[Vec<usize>], fwd: &[bool]) -> (Vec<usize>
     (rev_idx, ipdom)
 }
 
+pub(super) fn barriers_converge(parts: &Parts<'_>) -> bool {
+    let (uniform, _) = compute_uniformity(parts.p, parts.st, parts.res, &parts.io.inputs);
+    parts.p.blocks.iter().zip(uniform).all(|(block, together)| {
+        together || !block.insts.iter().any(|inst| inst.name() == "s_barrier")
+    })
+}
+
 /// Computes which IR blocks are thread-group uniform (all active threads arrive
 /// together) and which IR values hold group-uniform scalars.
 fn compute_uniformity(
