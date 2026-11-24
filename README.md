@@ -63,6 +63,21 @@ by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
 `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
 Each is described in a comment where it is read.
 
+### RTX 3090 Prologue test
+
+In Series X mode, both the RTX 3090 and RTX 4080 SUPER rendered the prison window on revision `004bf69`. Both then reported a GPU hang during the same indirect compute dispatch. A second RTX 3090 test skipped that dispatch and later hung in a related particle-lighting pass.
+
+The following PowerShell settings let the RTX 3090 continue into the first room and display the interaction prompt at the table. The test used a diagnostics build, a Prologue save and a warmed pipeline cache from the same GPU.
+
+```powershell
+$env:VICTORY_ADAPTER = 'RTX 3090'
+$env:VICTORY_PIPELINE_WAIT_MS = '24'
+$env:VICTORY_TEXTURE_NO_WAIT = '1'
+$env:VICTORY_SKIP_PIPELINES = '2561af9577c47289,c06aa62112ffba4c'
+```
+
+This workaround omits two particle-lighting passes. Frame rate in the room was around 1–2 FPS.
+
 ### Known problems
 
 - Everything in shadow is black (see above).
