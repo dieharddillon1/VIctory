@@ -497,6 +497,8 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Source and destination host copies that have exchanged aliased texels.
+    texture_aliases: std::collections::HashSet<(usize, usize)>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1015,6 +1017,22 @@ impl HostList {
         self.track(&copy, wanted).map(|before| (texture, before))
     }
 
+    /// Transitions a retained host texture and returns its previous state
+    /// when it changed. The prelude handles the first use just as for a title
+    /// resource passed to `transition`.
+    pub(crate) fn transition_copy(&self, copy: &HostCopy, wanted: u32) -> Option<u32> {
+        let wanted = legal_state(&copy.texture, wanted);
+        let before = self.track(copy, wanted)?;
+        let barrier = transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(wanted as i32),
+        );
+        // SAFETY: the list is open; its state tracker holds the host copy.
+        unsafe { self.list.ResourceBarrier(&[barrier]) };
+        Some(before)
+    }
+
     /// Notes that the list has `copy` in `wanted` from here on: the state it
     /// leaves, if that is a change (none on the list's first use).
     fn track(&self, copy: &HostCopy, wanted: u32) -> Option<u32> {
@@ -1371,6 +1389,14 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Whether this list has yet copied this specific texture alias.
+    pub(crate) fn first_alias(&self, source: &HostCopy, destination: &HostCopy) -> bool {
+        self.deferred().texture_aliases.insert((
+            std::sync::Arc::as_ptr(source) as usize,
+            std::sync::Arc::as_ptr(destination) as usize,
+        ))
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.

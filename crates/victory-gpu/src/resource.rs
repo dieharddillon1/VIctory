@@ -1021,6 +1021,66 @@ pub(crate) struct HostTexture {
     pub(crate) twin: Option<std::sync::Arc<HostTexture>>,
 }
 
+/// Packed light written into R32_UINT and read through an
+/// R9G9B9E5_SHAREDEXP placed view of the same title memory.
+#[cfg(windows)]
+struct LightSource {
+    owner: usize,
+    desc: ResourceDesc,
+    host: std::sync::Weak<HostTexture>,
+}
+
+#[cfg(windows)]
+static LIGHT_SOURCES: std::sync::Mutex<std::collections::BTreeMap<u64, LightSource>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(windows)]
+fn light_source(desc: &ResourceDesc) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+    const RENDER_TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    const UNORDERED_ACCESS: u32 = 4;
+    desc.dimension != BUFFER
+        && desc.format == DXGI_FORMAT_R32_UINT.0 as u32
+        && desc.flags & DEPTH == 0
+        && desc.flags & (RENDER_TARGET | UNORDERED_ACCESS) != 0
+}
+
+/// Finds a GPU-written copy for a placed packed-light view without borrowing
+/// the title's resource object after the registry lock is released.
+#[cfg(windows)]
+pub(crate) fn placed_light_source(placed: This) -> Option<std::sync::Arc<HostTexture>> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if placed.is_null()
+        || !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "0"))
+    {
+        return None;
+    }
+    let placed = resource(placed);
+    let desc = &placed.desc;
+    if desc.format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32
+        || desc.flags & 7 != 0
+        || desc.sample_count != 1
+        || desc.mip_levels == 0
+    {
+        return None;
+    }
+    let sources = LIGHT_SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    let source = sources.get(&(placed.data() as u64))?;
+    let writer = &source.desc;
+    if writer.dimension != desc.dimension
+        || writer.width != desc.width
+        || writer.height != desc.height
+        || writer.depth_or_array_size != desc.depth_or_array_size
+        || writer.mip_levels != desc.mip_levels
+        || writer.sample_count != desc.sample_count
+    {
+        return None;
+    }
+    source.host.upgrade()
+}
+
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
 #[cfg(windows)]
@@ -1316,6 +1376,17 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
+    #[cfg(windows)]
+    if light_source(&desc) && let Some(host) = &resource.host {
+        LIGHT_SOURCES.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            resource.data() as u64,
+            LightSource {
+                owner: std::ptr::from_ref::<Resource>(&resource) as usize,
+                desc,
+                host: std::sync::Arc::downgrade(host),
+            },
+        );
+    }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
@@ -1338,6 +1409,14 @@ impl Drop for Resource {
                     desc = ?self.desc,
                     "a title texture was released while a list not yet reset names its host copy"
                 );
+            }
+        }
+        if light_source(&self.desc) {
+            let owner = std::ptr::from_ref(self) as usize;
+            let address = self.data() as u64;
+            let mut sources = LIGHT_SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+            if sources.get(&address).is_some_and(|source| source.owner == owner) {
+                sources.remove(&address);
             }
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);

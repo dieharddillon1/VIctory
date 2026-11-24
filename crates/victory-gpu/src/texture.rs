@@ -16,13 +16,14 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
+use crate::resource::HostTexture;
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -68,6 +69,201 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
+/// A GPU-local copy buffer with matching byte layouts for both formats.
+struct AliasCopy {
+    buffer: ID3D12Resource,
+    bytes: u64,
+    layouts: Vec<(
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    )>,
+}
+
+const MAX_ALIAS_PARTS: u32 = 54;
+const ALIAS_CACHE_BYTES: u64 = 256 << 20;
+type AliasCache = VecDeque<(usize, Arc<AliasCopy>)>;
+static LIGHT_ALIAS_COPIES: Mutex<AliasCache> = Mutex::new(VecDeque::new());
+
+fn alias_copy_buffer(
+    placed: This,
+    source: &ID3D12Resource,
+    destination: &ID3D12Resource,
+) -> Option<Arc<AliasCopy>> {
+    let mut cache = LIGHT_ALIAS_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(index) = cache.iter().position(|(key, _)| *key == placed as usize) {
+        let entry = cache.remove(index)?;
+        let copy = entry.1.clone();
+        cache.push_back(entry);
+        return Some(copy);
+    }
+    let host = host()?;
+    // SAFETY: live textures.
+    let (from, to) = unsafe { (source.GetDesc(), destination.GetDesc()) };
+    let layers = if from.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(from.DepthOrArraySize)
+    };
+    let count = u32::from(from.MipLevels) * layers;
+    if !(1..=MAX_ALIAS_PARTS).contains(&count) {
+        return None;
+    }
+    let mut footprints =
+        [(); 2].map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize]);
+    let mut bytes = [0; 2];
+    for (index, desc) in [from, to].iter().enumerate() {
+        // SAFETY: each output holds one footprint per subresource.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                desc,
+                0,
+                count,
+                0,
+                Some(footprints[index].as_mut_ptr()),
+                None,
+                None,
+                Some(&mut bytes[index]),
+            );
+        }
+    }
+    let same = footprints[0].iter().zip(&footprints[1]).all(|(a, b)| {
+        let (from, to) = (a.Footprint, b.Footprint);
+        a.Offset == b.Offset
+            && (from.Width, from.Height, from.Depth, from.RowPitch)
+                == (to.Width, to.Height, to.Depth, to.RowPitch)
+    });
+    let size = bytes[0];
+    if !same || size != bytes[1] || !(1..=ALIAS_CACHE_BYTES).contains(&size) {
+        return None;
+    }
+    let mut used: u64 = cache.iter().map(|(_, copy)| copy.bytes).sum();
+    while used + size > ALIAS_CACHE_BYTES {
+        used -= cache.pop_front()?.1.bytes;
+    }
+
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buffer = None;
+    // SAFETY: plain creation of a GPU-local copy buffer; the output is ours.
+    unsafe {
+        host.device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        ).ok()?;
+    }
+    let buffer = buffer?;
+    crate::host::name(&buffer, || {
+        format!("packed light alias {}x{} parts {count}", from.Width, from.Height)
+    });
+    let [written, read] = footprints;
+    let copy = Arc::new(AliasCopy {
+        buffer,
+        bytes: size,
+        layouts: written.into_iter().zip(read).collect(),
+    });
+    cache.push_back((placed as usize, copy.clone()));
+    tracing::info!(
+        width = from.Width,
+        height = from.Height,
+        parts = count,
+        "copying a GPU-written packed light alias"
+    );
+    Some(copy)
+}
+
+/// Makes the placed light view read the bits written by a GPU pass. Keep
+/// both textures in the list's state tracker and the intermediate buffer in
+/// the list's retained resources, independently of title/cache lifetimes.
+pub(crate) fn copy_light_alias(list: &HostList, placed: This, source: &Arc<HostTexture>) -> bool {
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    const WRITABLE: u32 = 0x4 | 0x8;
+
+    let Some(destination) = crate::resource::host_copy(placed) else {
+        return false;
+    };
+    let Some(copy) = alias_copy_buffer(placed, &source.texture, &destination.texture) else {
+        return false;
+    };
+    let first = list.first_alias(source, &destination);
+    let before = list.transition_copy(source, COPY_SOURCE);
+    if !first && before.is_none() {
+        return true;
+    }
+    list.transition_copy(&destination, COPY_DEST);
+    let buffer_at = |layout: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: borrowed COM pointer, never released by this location.
+        pResource: unsafe { std::mem::transmute_copy(&copy.buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: layout },
+    };
+    let texture_at = |resource: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: borrowed COM pointer, never released by this location.
+        pResource: unsafe { std::mem::transmute_copy(resource) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+    };
+    let barrier = |before, after| crate::host::transition(&copy.buffer, before, after);
+    let (common, read, written) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    // SAFETY: an open list, compatible footprints, and retained resources
+    // in the stated copy states. Each staging use ends in its initial state.
+    unsafe {
+        let commands = &list.list;
+        commands.ResourceBarrier(&[barrier(common, written)]);
+        for (index, &(from, _)) in copy.layouts.iter().enumerate() {
+            commands.CopyTextureRegion(
+                &buffer_at(from),
+                0,
+                0,
+                0,
+                &texture_at(&source.texture, index as u32),
+                None,
+            );
+        }
+        commands.ResourceBarrier(&[barrier(written, read)]);
+        for (index, &(_, to)) in copy.layouts.iter().enumerate() {
+            commands.CopyTextureRegion(
+                &texture_at(&destination.texture, index as u32),
+                0,
+                0,
+                0,
+                &buffer_at(to),
+                None,
+            );
+        }
+        commands.ResourceBarrier(&[barrier(read, common)]);
+    }
+    list.keep(&copy.buffer);
+    // A draw may also bind the source for writing right after this read.
+    if let Some(state) = before.filter(|state| state & WRITABLE != 0) {
+        list.transition_copy(source, state);
+    }
+    true
+}
+
 thread_local! {
     /// Texture memory read for hashing and detiling: one per submitting
     /// thread, as large as the largest texture it read.
@@ -95,6 +291,10 @@ pub(crate) fn forget(resource: usize) {
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
     }
+    LIGHT_ALIAS_COPIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(key, _)| *key != resource);
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -908,6 +1108,153 @@ mod tests {
         );
         assert_eq!(hr, crate::object::S_OK);
         ResourceGuard(resource)
+    }
+
+    fn alias_test_texture(
+        region: &VirtualRegion,
+        width: u32,
+        format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> ResourceGuard {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(width),
+            Height: width,
+            DepthOrArraySize: 2,
+            MipLevels: 2,
+            Format: format,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT(0x109),
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut resource = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                region.ptr as u64,
+                (&raw const desc).cast(),
+                0,
+                std::ptr::null(),
+                &crate::resource::PAGEABLE_IIDS[0],
+                &mut resource,
+            ),
+            crate::object::S_OK,
+        );
+        ResourceGuard(resource)
+    }
+
+    /// Records a GPU write into one subresource by copying an upload buffer.
+    fn write_alias_subresource(
+        host: &crate::host::Host,
+        list: &HostList,
+        source: &Arc<HostTexture>,
+        subresource: u32,
+        value: u32,
+    ) {
+        let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut rows, mut row_bytes, mut size) = (0, 0, 0);
+        // SAFETY: a live texture and one footprint's worth of outputs.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &source.texture.GetDesc(),
+                subresource,
+                1,
+                0,
+                Some(&mut layout),
+                Some(&mut rows),
+                Some(&mut row_bytes),
+                Some(&mut size),
+            );
+        }
+        let (upload, data) = host.upload_buffer(size).unwrap();
+        // SAFETY: row sizes and pitch came from the resource footprint and
+        // the mapping is at least its reported byte span.
+        unsafe {
+            for row in 0..rows as usize {
+                let start = layout.Offset as usize + row * layout.Footprint.RowPitch as usize;
+                let words = std::slice::from_raw_parts_mut(
+                    data.add(start).cast::<u32>(),
+                    row_bytes as usize / 4,
+                );
+                words.fill(value);
+            }
+        }
+        list.transition_copy(source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the location borrows the live texture.
+            pResource: unsafe { std::mem::transmute_copy(&source.texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: subresource },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the location borrows the live upload buffer.
+            pResource: unsafe { std::mem::transmute_copy(&upload) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: layout },
+        };
+        // SAFETY: both resources are live and in copy-compatible states.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        list.keep(&upload);
+    }
+
+    #[test]
+    fn packed_light_alias_copies_second_mip_and_layer_and_retains_writes() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+        };
+
+        let Some(host) = host() else { return };
+        let region = VirtualRegion::reserve(1 << 20);
+        let written = alias_test_texture(
+            &region, 64, DXGI_FORMAT_R32_UINT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+        let placed = alias_test_texture(
+            &region, 64, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_RESOURCE_FLAG_NONE,
+        );
+        let wrong_size = alias_test_texture(
+            &region, 32, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_RESOURCE_FLAG_NONE,
+        );
+        assert!(crate::resource::placed_light_source(wrong_size.0).is_none());
+        let source = crate::resource::placed_light_source(placed.0).unwrap();
+        let held = Arc::downgrade(&source);
+
+        let list = host.new_list().unwrap();
+        const LAST_PART: u32 = 3; // layer 1 * two mips + mip 1
+        const UAV: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+        write_alias_subresource(host, &list, &source, 0, 0xa123_4567);
+        write_alias_subresource(host, &list, &source, LAST_PART, 0x89ab_cdef);
+        list.transition_copy(&source, UAV);
+        assert!(copy_light_alias(&list, placed.0, &source));
+
+        // A second write in the same list must invalidate the earlier copy.
+        write_alias_subresource(host, &list, &source, LAST_PART, 0xfedc_ba98);
+        list.transition_copy(&source, UAV);
+        assert!(copy_light_alias(&list, placed.0, &source));
+        drop(written);
+        drop(source);
+        assert!(crate::resource::placed_light_source(placed.0).is_none());
+        assert!(held.upgrade().is_some(), "recorded list holds the writer copy");
+
+        // Simulate losing the cached GPU copy buffer before submission.
+        forget(placed.0 as usize);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(held.upgrade().unwrap().state.load(Relaxed), UAV);
+        list.reset();
+        assert!(held.upgrade().is_none(), "reset releases the writer copy");
+
+        let view = crate::resource::host_resource(placed.0).unwrap();
+        for (subresource, value) in [(0, 0xa123_4567u32), (LAST_PART, 0xfedc_ba98)] {
+            let bytes = readback_mip(host, placed.0, view, subresource);
+            let side = if subresource == 0 { 64 } else { 32 };
+            assert_eq!(bytes.len(), side * side * 4);
+            assert!(bytes.chunks_exact(4).all(|word| word == value.to_le_bytes()));
+        }
     }
 
     #[test]

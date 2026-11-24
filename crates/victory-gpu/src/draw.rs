@@ -1660,19 +1660,24 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     }
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
-            if let Some(t) = crate::resource::host_resource(*resource as This)
+            let resource = *resource as This;
+            let aliased = placed.is_some()
+                && crate::resource::placed_light_source(resource)
+                    .is_some_and(|source| crate::texture::copy_light_alias(list, resource, &source));
+            if !aliased
+                && let Some(t) = crate::resource::host_resource(resource)
                 && crate::texture::title_written(t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                crate::texture::upload(list, resource, t);
             }
-            crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
+            crate::list::ensure_state(list, resource, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            if let Some(t) = crate::resource::host_resource(resource) {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {
                     tracing::debug!(
-                        resource = format_args!("{resource:#x}"),
+                        resource = format_args!("{:#x}", resource as usize),
                         ?d,
                         "a shader reads a texture the title fills"
                     );
