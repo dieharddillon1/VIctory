@@ -1607,3 +1607,170 @@ fn lane_mask_phi_joins_execute_correctly() {
         )],
     );
 }
+
+/// A synthetic compute shader with a 2D gather, user-provided address,
+/// immediate sampler and a raw output buffer.
+fn gather_shader(
+    with_offset: bool,
+    sampler_words: [u32; 4],
+) -> Result<HostShader, crate::ShaderError> {
+    let mut texture = s_load_dwordx4(12, 6);
+    texture[0] |= 1 << 18; // x8 descriptor.
+    let mut words = vec![
+        s_mov_b32(6, 4),
+        s_mov_b32(7, 0x80),
+        s_mov_b32(8, 5),
+        s_mov_b32(9, 0x80),
+    ];
+    words.extend(texture);
+    words.extend(s_load_dwordx4(20, 8));
+    for (i, word) in sampler_words.into_iter().enumerate() {
+        words.extend([s_mov_b32(24 + i as u8, 0xFF), word]);
+    }
+    for i in 0..4 {
+        words.push(vop1(1, 2 + i, sgpr(i)));
+    }
+    let op = if with_offset { 0x54 } else { 0x44 };
+    words.extend([
+        0xF000_0000 | op << 18 | 4 << 8 | 1 << 3,
+        2 | 20 << 8 | 3 << 16 | 6 << 21,
+    ]);
+    for i in 0..4 {
+        words.extend(buffer_store_dword(20 + i, 20, 4 * i as u16));
+    }
+    words.push(S_ENDPGM);
+    let table = |user_data, slot, sgprs, root| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let used = |kind, user_data, slot, dwords| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords,
+        user_data,
+        slot,
+    };
+    let n = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![
+            table(0, 0, 4, RootType::Constants),
+            table(4, 1, 1, RootType::Table),
+            table(5, 2, 1, RootType::Table),
+        ],
+        used: vec![
+            used(ResourceType::Srv, 4, 1, 8),
+            used(ResourceType::Uav, 5, 2, 4),
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 6 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&n.code, n.wave64, n.vgprs)?;
+    let res = resource::track(&p, &n.layout, n.stage)?;
+    let io = io::raise(&p, &n)?;
+    let st = structure::structure(&p)?;
+    let bytes = crate::dxbc::build(&[]);
+    let container = crate::Container::parse(&bytes)?;
+    super::emit(&container, &n, &p, &st, &io, &res)
+}
+
+#[test]
+fn runtime_gather_respects_mip_range_texel_order_and_addressing() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    let texel = |level, x, y| (100 * level + 8 * y + x + 1) as f32;
+    let texels: Vec<_> = (0..3)
+        .flat_map(|mip| {
+            let size = 8 >> mip;
+            (0..size * size).map(move |i| [0.0, 0.0, texel(mip, i % size, i / size), 0.0])
+        })
+        .collect();
+    let views = [View::TextureMips(8, 8, 3, &texels), View::RawUav(4)];
+    for (address, min, max, with_offset) in [(2, 0, 3, false), (0, 1, 1, true), (6, 0, 3, true)] {
+        let mut shader = gather_shader(
+            with_offset,
+            [address * 0x49, max << 20 | min << 8, 0x1850_0000, 0],
+        )
+        .expect("lower gather");
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil).expect("validate gather");
+        }
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .expect("create gather pipeline");
+        for (lod, u, v, dx, dy) in [
+            (-3.0f32, 0.625f32, 0.375f32, 0, 0),
+            (1.25, 0.50, 0.75, -31, 29),
+            (100.0, 0.0, 1.0, 0, 1),
+        ] {
+            let packed_offset = (dx & 63) as u32 | ((dy & 63) as u32) << 8;
+            let values = [u.to_bits(), v.to_bits(), lod.to_bits()];
+            let values = if with_offset {
+                [packed_offset, values[0], values[1], values[2]]
+            } else {
+                [values[0], values[1], values[2], 0]
+            };
+            let mut ud = vec![0; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => values[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    (RootType::Table, 2) => 32,
+                    (root, _) => super::host::guard(root, views.len(), 0).expect("heap guard"),
+                };
+            }
+            let result = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("dispatch gather");
+            let mip = (lod.round_ties_even() as i32).clamp(min as i32, (max as i32).min(2));
+            let size = 8 >> mip;
+            let x = (u * size as f32 - 0.5).floor() as i32 + if with_offset { dx } else { 0 };
+            let y = (v * size as f32 - 0.5).floor() as i32 + if with_offset { dy } else { 0 };
+            let expected = [(x, y + 1), (x + 1, y + 1), (x + 1, y), (x, y)].map(|(x, y)| {
+                let valid = |p| (0..size).contains(&p);
+                let value = match address {
+                    0 => texel(mip, x.rem_euclid(size), y.rem_euclid(size)),
+                    6 if !(valid(x) && valid(y)) => 0.0,
+                    _ => texel(mip, x.clamp(0, size - 1), y.clamp(0, size - 1)),
+                };
+                value.to_bits()
+            });
+            assert_eq!(
+                result[0], expected,
+                "address {address}, lod {lod}, mip {mip}"
+            );
+        }
+    }
+    let biased = [0, 3 << 20, 0x1850_0001, 0];
+    assert!(
+        gather_shader(false, biased)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported sampler")
+    );
+}

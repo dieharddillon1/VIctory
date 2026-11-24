@@ -7464,7 +7464,8 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4" | "image_gather4_l" | "image_gather4_l_o" | "image_gather4_lz"
+            | "image_gather4_lz_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -7509,6 +7510,7 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
+        let mut gathered = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -7708,16 +7710,33 @@ impl<'a> Lower<'a> {
                             os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
                         }
                     }
-                    args.extend(&os[..2]);
-                    args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    if matches!(name, "image_gather4_l" | "image_gather4_l_o") {
+                        if kind != 2 || *unorm {
+                            return Err("a runtime-level gather outside normalized 2D textures");
+                        }
+                        let lod = addr_val(self, first + coords)?;
+                        let lod = to_float(self, lod);
+                        gathered = Some(self.gather_at_mip(
+                            [h, sh],
+                            [cs[0], cs[1]],
+                            [os[0], os[1]],
+                            lod,
+                            ss,
+                            dmask.trailing_zeros(),
+                        )?);
+                        self.s.m.undef(self.s.t.res_ret)
+                    } else {
+                        args.extend(&os[..2]);
+                        args.push(self.s.m.i32(dmask.trailing_zeros()));
+                        self.s.op(
+                            c,
+                            "textureGather.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            73,
+                            &args,
+                        )
+                    }
                 }
             }
         } else {
@@ -7756,7 +7775,10 @@ impl<'a> Lower<'a> {
         };
         let mut xs = Vec::new();
         for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
+            let x = match gathered {
+                Some(texels) => texels[ch as usize],
+                None => self.s.m.extract(c, r, ch),
+            };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
@@ -7785,6 +7807,124 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// A plain 2D gather at an explicit level uses four level samples so that
+    /// the same sampler still defines address modes and border values.
+    fn gather_at_mip(
+        &mut self,
+        [texture, sampler_handle]: [V; 2],
+        coords: [V; 2],
+        offsets: [V; 2],
+        lod: V,
+        sampler: &Source,
+        channel: u32,
+    ) -> Result<[V; 4], Why> {
+        let Source::Constant(words) = sampler else {
+            return Err("a runtime-level gather with a runtime sampler");
+        };
+        let words: [u32; 4] = words
+            .get(..4)
+            .and_then(|w| w.try_into().ok())
+            .ok_or("a sampler constant")?;
+        let sampler = super::sampler::StaticSampler::from_words(words);
+        let force_unnormalized = words[0] & (1 << 15) != 0;
+        let approximated_address = [words[0] & 7, (words[0] >> 3) & 7]
+            .into_iter()
+            .any(|mode| !matches!(mode, 0 | 1 | 2 | 6));
+        // These settings would change the footprint, mix values away from
+        // the texel centers, or require an unsupported border color.
+        if sampler.mip_lod_bias != 0.0
+            || sampler.min_lod.fract() != 0.0
+            || sampler.max_lod.fract() != 0.0
+            || sampler.min_lod > sampler.max_lod
+            || sampler.filter & 0x1C0 != 0
+            || force_unnormalized
+            || approximated_address
+            || words[3] >> 30 == 3
+        {
+            return Err("a runtime-level gather with an unsupported sampler");
+        }
+
+        let c = self.cur;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let zero = self.s.m.i32(0);
+        let mip0 = self.s.op(
+            c,
+            "getDimensions",
+            Attr::ReadOnly,
+            dims,
+            72,
+            &[texture, zero],
+        );
+        let levels = self.s.m.extract(c, mip0, 3);
+        let levels = self.s.m.cast(c, Cast::UiToFp, levels, f32t);
+        let one = self.s.m.f32(1.0f32.to_bits());
+        let levels = self.binary(35, levels, one);
+        let view_last = self.s.m.bin(c, Bin::Sub, levels, one);
+        let max = self.s.m.f32(sampler.max_lod.to_bits());
+        let max = self.binary(36, max, view_last);
+        let min = self.s.m.f32(sampler.min_lod.to_bits());
+        let min = self.binary(36, min, max);
+        let level = self.unary(26, lod);
+        let level = self.binary(35, level, min);
+        let level = self.binary(36, level, max);
+        let mip = self.s.m.cast(c, Cast::FpToSi, level, i32t);
+        let dimensions = self.s.op(
+            c,
+            "getDimensions",
+            Attr::ReadOnly,
+            dims,
+            72,
+            &[texture, mip],
+        );
+
+        let half = self.s.m.f32(0.5f32.to_bits());
+        let undef_float = self.s.m.undef(f32t);
+        let undef_int = self.s.m.undef(i32t);
+        let [(width, x), (height, y)] = [0, 1].map(|axis| {
+            let size = self.s.m.extract(c, dimensions, axis as u32);
+            let size = self.s.m.cast(c, Cast::UiToFp, size, f32t);
+            let size = self.binary(35, size, one);
+            let texel = self.s.m.bin(c, Bin::Mul, coords[axis], size);
+            let texel = self.s.m.bin(c, Bin::Sub, texel, half);
+            let texel = self.unary(27, texel);
+            let offset = self.s.m.cast(c, Cast::SiToFp, offsets[axis], f32t);
+            (size, self.s.m.bin(c, Bin::Add, texel, offset))
+        });
+        // Gather order is lower left, lower right, upper right, upper left.
+        Ok(
+            [[0.5f32, 1.5], [1.5, 1.5], [1.5, 0.5], [0.5, 0.5]].map(|[dx, dy]| {
+                let dx = self.s.m.f32(dx.to_bits());
+                let dy = self.s.m.f32(dy.to_bits());
+                let u = self.s.m.bin(c, Bin::Add, x, dx);
+                let v = self.s.m.bin(c, Bin::Add, y, dy);
+                let u = self.s.m.bin(c, Bin::SDiv, u, width);
+                let v = self.s.m.bin(c, Bin::SDiv, v, height);
+                let args = [
+                    texture,
+                    sampler_handle,
+                    u,
+                    v,
+                    undef_float,
+                    undef_float,
+                    zero,
+                    zero,
+                    undef_int,
+                    level,
+                ];
+                let sample = self.s.op(
+                    c,
+                    "sampleLevel.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    62,
+                    &args,
+                );
+                self.s.m.extract(c, sample, channel)
+            }),
+        )
     }
 
     /// The direction a cube sample's face coordinates stand for: the
