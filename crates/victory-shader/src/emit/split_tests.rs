@@ -10,6 +10,19 @@ use crate::native::{RootParam, RootType, StageIo};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+/// Limit a diagnostic run to the requested hardware (all adapters by default).
+fn test_adapters() -> Result<Vec<String>, String> {
+    let mut names = adapters()?;
+    if let Ok(filter) = std::env::var("VICTORY_ADAPTER")
+        && !filter.is_empty()
+    {
+        let needle = filter.to_lowercase();
+        names.retain(|name| name.to_lowercase().contains(&needle));
+        assert!(!names.is_empty(), "no hardware adapter matched {filter:?}");
+    }
+    Ok(names)
+}
+
 /// The wave size a DXIL container's `PSV0` requires (minimum = maximum).
 fn wave_size(dxil: &[u8]) -> Option<u32> {
     let c = crate::Container::parse(dxil).ok()?;
@@ -99,7 +112,7 @@ fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u3
 
 #[test]
 fn in_half_lane_reads_match_the_console_on_every_adapter() {
-    let Ok(names) = adapters() else {
+    let Ok(names) = test_adapters() else {
         eprintln!("no DXGI; skipped");
         return;
     };
@@ -173,7 +186,7 @@ fn program_3d(threads: [u32; 3]) -> crate::NativeProgram {
 
 #[test]
 fn three_dimensional_groups_keep_the_consoles_lanes() {
-    let Ok(names) = adapters() else {
+    let Ok(names) = test_adapters() else {
         eprintln!("no DXGI; skipped");
         return;
     };
@@ -219,7 +232,7 @@ fn program_case(label: &str, p: &crate::NativeProgram, want: impl Fn(u32) -> u32
         unreachable!()
     };
     let threads = io.threads[0];
-    let Ok(names) = adapters() else {
+    let Ok(names) = test_adapters() else {
         eprintln!("no DXGI; skipped");
         return;
     };
@@ -963,7 +976,7 @@ fn selects_on_masks_held_as_numbers() {
         0xD501_0002,
         0x002A_0101, // v_cndmask_b32 v2, v1, v0, s[10:11]
     ];
-    let Ok(names) = adapters() else {
+    let Ok(names) = test_adapters() else {
         eprintln!("no DXGI; skipped");
         return;
     };
