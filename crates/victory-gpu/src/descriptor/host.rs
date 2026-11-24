@@ -440,7 +440,13 @@ impl HostHeap {
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            ..Default::default()
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: 1,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
         };
         // SAFETY: a slot of our heap; a null resource is allowed with a desc.
         unsafe {
@@ -1191,6 +1197,17 @@ mod tests {
         assert_eq!(raw_elements(7), 1);
         assert_eq!(raw_elements(0), 1);
         assert_eq!(raw_elements(u64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn raw_null_uav_is_accepted_by_the_device() {
+        let Some(host) = host() else { return };
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let _ = host.log_messages();
+        heap.null_raw_uav_at(0);
+        assert_eq!(host.log_messages(), None);
+        // SAFETY: a live device and a plain query.
+        unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
