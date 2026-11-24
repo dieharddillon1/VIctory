@@ -17,6 +17,7 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const TILED_RESOURCES: u64 = 1 << 12;
+    pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
@@ -53,6 +54,10 @@ pub(crate) struct Shader {
     /// Test builds: the property words of each handle annotation, in order.
     #[cfg(test)]
     pub annotations: Vec<(u32, u32)>,
+    /// Test builds: each `dx.op` call made, as its opcode and its first
+    /// argument where that is a constant.
+    #[cfg(test)]
+    calls: Vec<(u32, Option<i64>)>,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -61,6 +66,8 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// Maximum emitted vertices of a single-stream triangle GS.
+    pub gs_vertices: Option<u16>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -106,6 +113,21 @@ pub(crate) fn last_summary() -> String {
     LAST.with(|l| l.borrow().clone())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// See [`last_calls`].
+    static LAST_CALLS: std::cell::RefCell<Vec<(u32, Option<i64>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test builds: the `dx.op` calls of the module this thread finished last,
+/// in the order they were made: the opcode, and the first argument where
+/// that is a constant (a barrier's mode, say).
+#[cfg(test)]
+pub(crate) fn last_calls() -> Vec<(u32, Option<i64>)> {
+    LAST_CALLS.with(|l| l.borrow().clone())
+}
+
 impl Shader {
     pub fn new(pixel: bool) -> Self {
         let mut m = Module::default();
@@ -128,6 +150,8 @@ impl Shader {
             m,
             #[cfg(test)]
             annotations: Vec::new(),
+            #[cfg(test)]
+            calls: Vec::new(),
             t: Types {
                 void,
                 i1,
@@ -144,6 +168,7 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            gs_vertices: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -194,6 +219,9 @@ impl Shader {
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+        #[cfg(test)]
+        self.calls
+            .push((opcode, args.first().and_then(|&a| self.m.known(a))));
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
         self.m.call(block, f, all)
@@ -349,6 +377,8 @@ impl Shader {
         let ops: Vec<&str> = self.ops.iter().map(String::as_str).collect();
         let summary = format!("{threads}wave size {wave}; ops: {}", ops.join(", "));
         LAST.with(|l| *l.borrow_mut() = summary);
+        #[cfg(test)]
+        LAST_CALLS.with(|l| *l.borrow_mut() = std::mem::take(&mut self.calls));
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -511,6 +541,9 @@ impl Shader {
                     });
                 }
             }
+            if self.gs_vertices.is_some() {
+                view.extend([0; 3]);
+            }
             let arr = self.m.array(view.len() as u32, self.t.i32);
             let elems: Vec<V> = view.iter().map(|&v| self.m.i32(v)).collect();
             let arr = self.m.aggregate(arr, &elems);
@@ -527,6 +560,10 @@ impl Shader {
         } else {
             None
         };
+        // A pixel shader with an SV_StencilRef output (as DXC collects it).
+        if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
+            self.flags |= flags::STENCIL_REF;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -540,6 +577,11 @@ impl Shader {
             let i64t = self.m.int(64);
             let f = self.m.int_const(i64t, self.flags as i64);
             props.push(self.m.md_value(f));
+        }
+        if let Some(maximum) = self.gs_vertices {
+            props.push(i32c(&mut self, 1));
+            let state = [3, u32::from(maximum), 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
+            props.push(self.m.md_node(state.to_vec()));
         }
         if let Some(threads) = self.threads {
             let t = threads.map(|n| Some(i32c(&mut self, n)));
@@ -593,8 +635,9 @@ impl Shader {
             version
         };
         self.m.named_md("dx.valver", vec![valver]);
-        // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
+            _ if self.gs_vertices.is_some() => ("gs", 2u32),
             _ if self.mesh.is_some() => ("ms", 13u32),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
@@ -618,6 +661,9 @@ impl Shader {
         let mut features = 0u64;
         if self.flags & flags::TILED_RESOURCES != 0 {
             features |= 0x100;
+        }
+        if self.flags & flags::STENCIL_REF != 0 {
+            features |= 0x200;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
@@ -653,6 +699,7 @@ impl Shader {
         };
         let psv0 = container::psv(&Psv {
             stage: kind as u8,
+            gs_vertices: self.gs_vertices,
             flag: flag && self.threads.is_none(),
             inputs: &self.inputs,
             outputs: &self.outputs,

@@ -184,17 +184,27 @@ pub struct Export {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Io {
+    pub geometry: Option<Box<crate::geometry::Streams>>,
     /// Input values the hardware loads, with their meaning; other VGPRs
     /// read before written hold undefined values.
     pub inputs: Vec<(Value, Input)>,
     pub interps: Vec<(Site, Interp)>,
     pub exports: Vec<Export>,
+    /// Compute: how many SGPRs the hardware initializes
+    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
+    pub initialized_sgprs: Option<u8>,
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
 /// stages whose stage data is not read and on constructs not covered yet.
 pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
+    if let (StageIo::Gs(gs), HwStage::Gs) = (&native.io, native.stage) {
+        return Ok(Io {
+            geometry: Some(Box::new(crate::geometry::raise(p, gs)?)),
+            ..Io::default()
+        });
+    }
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
         (
             StageIo::Ps {
@@ -294,6 +304,10 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
 
     let mut io = Io {
         inputs: inputs.clone(),
+        initialized_sgprs: match &native.io {
+            StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            _ => None,
+        },
         ..Io::default()
     };
     // Only a second interpolation half needs to trace SSA definitions.

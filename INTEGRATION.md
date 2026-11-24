@@ -6,8 +6,9 @@ together. It is **not an official release**. The maintainer has not
 reviewed or merged any of these PRs, and each may still change or be
 turned down upstream.
 
-- Base: upstream `main` at `d2a4bae` (Marvisak/VIctory, "Merge pull request
-  #129").
+- Base: upstream `main` at `ffe310e` since update 7 (merged in as one
+  commit; before that `d2a4bae`). Mentions of `d2a4bae` below describe
+  runs and merges made on the old base.
 - Every PR comes in as its own merge commit (`git log --first-parent`), so
   you can find, revert or leave out each one.
 - Before inclusion, every PR was built and tested on one Windows 11
@@ -21,6 +22,68 @@ turned down upstream.
 - Update 4 adds #566 (with the rest of #307) and brings the wave64 stack
   to #439's head `055aef9`.
 - Update 5 adds #453 (pixel barycentrics), with one fix commit after it.
+- Update 6 adds #587 (mesh output bounds) with tests, and the switch
+  `VICTORY_HEAP_GUARD=0`. **On AMD cards read "Known problem on AMD"
+  below before running this tree.**
+- Update 7 takes upstream `main` `ffe310e` in (116 commits, #566 among
+  them, which is no longer a PR this tree adds), and adds
+  r4tedx/VIctory#10 (`VICTORY_PRESENT_1440P`) and a fix for
+  level-of-detail queries of array textures. **Fewer programs translate
+  than at update 5, on purpose: see "What update 7 costs" below.**
+- Update 8 adds geometry programs: the title's 195 single-stream
+  triangle geometry shaders translate and validate (two commits written
+  for this tree, see "Changes made in this branch"). Nothing else
+  changes in the offline count.
+
+## What update 7 costs
+
+Counted offline over the title's shaders (`victory translate --host-lanes
+32-32 --validate --list`, 25,889 programs, program by program): 24,746
+validated at update 5 and 24,533 at update 7. 221 that validated stop
+now, and 8 are new (the 3 pixel programs of the level-of-detail fix, 5
+compute programs through `main`'s rule for SGPRs the hardware does not
+initialize).
+
+All 221 come from one commit of `main` (`3dd467c`, "a phi that only
+another read phi consumes is live too"): with that rule alone switched
+off in an experimental build, the same count loses none. Before it, a
+value with no host form (a lane mask read as data, a descriptor word, the
+first half of an interpolation) that reached a read through two joins was
+taken for dead and replaced by zero; now the program is refused with that
+value's reason. So these programs did translate, with a zero where the
+console has a value, and how many of them drew right is not known. None
+of the 221 validates on plain `main` either. By reason: `a lane mask
+read as data` 108, `a structured buffer of unknown stride` 57, `the
+first half of an interpolation` 20, `a program the console structure
+cannot hold` 17, others 19.
+
+If a run at update 7 shows less than one at update 5 or 6, this is the
+first thing to suspect, and it is worth reporting.
+
+## Known problem on AMD (update 3 and later)
+
+A tester (nullmarsh, issue #293) reports that on an RX 9060 XT (driver
+32.0.32029.2010) the title dies about two seconds into the world with an
+access violation inside `amdxc64.dll`, in 3 of 3 runs at update 4, from
+this tree's merge of #483 (`7ef2c41`) on. With that merge reverted,
+update 5 ran 364 s in the world without a device loss. NVIDIA runs of
+this tree do not show it. The cause is not known. #483 merged another
+way onto `main` `ffe310e` ran 453 s on an RX 9070 XT with the same
+driver (h0useadv, on #483), so the suspects are what this tree's merge
+adds: the guard on #307's per-lane heap index, and where the guard slot
+sits.
+
+- **To run on AMD:** `git revert -m 1 7ef2c41` (it reverts cleanly at
+  update 5, per that report).
+- **What is known since (nullmarsh, update 6):** the fault is in
+  `CreateComputePipelineState`, so it is AMD's compiler on the shaders
+  this merge changes, not a read of the guard slot. `VICTORY_HEAP_GUARD=0`
+  does not help, as expected for a fault at pipeline creation. It moves
+  to another compute program when one is left out (three were named).
+  An RX 6750 XT ran update 5 for 10 minutes without it (mpDom, issue
+  #841), so it is not every AMD card or driver.
+- `VICTORY_HEAP_GUARD=0` stays as a switch: the same shaders, with
+  `u32::MAX` passed as the guard, so no index is redirected.
 
 ## Reports from the title
 
@@ -177,7 +240,13 @@ and the name is its author's GitHub login.
 - #307 (AntoninMichelq), head `6285e19`: waterfall loops over per-lane
   descriptors, and descriptors chosen by `s_cselect`. Its last two
   commits (`077ec8b`, `6285e19`) came in with #566.
-- #566 (r4tedx), head `6c63dea`: per-lane descriptors chosen by control
+- r4tedx/VIctory#10 (mpDom), head `d6897fa`: with
+  `VICTORY_PRESENT_1440P` set (diagnostics builds), the last 2560x1440
+  colour target the frame wrote is presented in place of the title's own
+  output, which stays black in the world while those targets hold the
+  scene (issue #841). Not run in the title here.
+- #566 (r4tedx), merged upstream since (in `main` from update 7 on;
+  listed for the history), head `6c63dea`: per-lane descriptors chosen by control
   flow (an if/else whose arms each set the descriptor, traced on the
   paths the accessing lanes take), and a waterfall loop is proven on the
   lane masks before the first lane's descriptor is taken as each lane's
@@ -187,6 +256,10 @@ and the name is its author's GitHub login.
   read as values come from `SV_Barycentrics`, and interpolation with
   computed barycentrics is evaluated from the vertex values. See
   "Changes made in this branch" for the fix that follows it.
+- #587 (FibbS6), head `1052a90`: a mesh lane's vertex and primitive
+  writes are kept inside the declared maxima, primitives no lane writes
+  are culled first, and a barrier only some lanes reach is emitted
+  without the thread-group sync. See "Changes made in this branch".
 - #309 (AntoninMichelq): SGPRs reloaded from VGPR lanes are read as the
   spilled value
 - #306 (wbkepler): DXIL validator failures (signatures, PSV0,
@@ -288,6 +361,22 @@ machines with newer drivers did not show it.
   it, `cargo test` sometimes never finishes, with several GPU tests stuck
   together. On the integration machine, before #433, 4 of 12 runs of the
   shader tests hung; with it, 0 of 12 did.
+- At update 8, one run of the same command with the machine at 100% CPU
+  from other work: 491 passed, 1 failed, 7 ignored. The failure is
+  `frame::tests::waits_end_on_ticks_and_count_frames`, which expects
+  consecutive 5 ms ticks and skipped ten or more at a time; it failed 3
+  of 3 on its own at that load and passed 3 of 3 on its own at update 6.
+  The update does not touch its file. The three geometry tests pass,
+  one of them a draw on the GPU compared with a reference draw.
+- At update 7, one run of the same command after `main` was merged in:
+  487 passed, 0 failed, 7 ignored; and one more at the update's head
+  (see the commit that adds this line for its numbers).
+- At update 6, one run of the same command with other threads' builds
+  on the CPU (85% load): 442 passed, 2 failed, 5 ignored. The two are
+  `frame::tests::waits_end_on_ticks_and_count_frames` (a timing test)
+  and `xgamesave::tests::a_kill_at_any_step_leaves_old_or_new`; each
+  passed 3 of 3 runs on its own afterwards, and neither is in code this
+  update changes.
 - At update 5, one run of `cargo test --workspace --no-fail-fast --
   --test-threads=4` on the RTX 5070 with no other GPU work started from
   here: 442 passed, 5 ignored.
@@ -468,6 +557,50 @@ is described in its merge or fix commit.
   RTX 5070 matched values computed on the CPU. On WARP, programs with
   both a perspective and a linear `SV_Barycentrics` drew wrong values,
   and so did DXC's own module for the same shader, so that is WARP's.
+- **#587's conflict and one change to it:** its `divergent_barriers`
+  sits beside #453's `interp_mode` in `emit/lower.rs` (both kept). Its
+  fence-only barriers are not applied in the console flow of the wave64
+  stack (#233, #320, #439): there every lane of a wave runs every block,
+  so the lanes reach a barrier together and the stack relies on the
+  sync. #587 came without tests; two are added (primitives past the
+  lanes are culled first, for four pairs of lane count and maximum, each
+  validated; a barrier under a per-lane branch has mode 8 and one every
+  lane reaches mode 9), with a test-only record of a module's `dx.op`
+  calls.
+- **`VICTORY_HEAP_GUARD=0`** (`draw.rs`): see "Known problem on AMD".
+- **The merge of `main` `ffe310e` (update 7):** conflicts in seven files;
+  the merge commit's message lists each. In short: both sides in
+  `list.rs`, `native.rs` and `emit/shader.rs`; in `emit/lower.rs` the
+  tree's IsNaN compares with `main`'s `olt | ogt` for `v_cmp_lg`, #160's
+  sample forms in place of `main`'s list of sample names and of its
+  immediate-offset block, and `main`'s zero for an SGPR the hardware
+  does not initialize beside the tree's barycentric inputs; the test
+  files merged item by item with all of both sides' tests.
+- **Geometry programs (update 8; two commits by this project's shader
+  work, not an upstream PR yet):** `Shaders: translate uncompressed
+  native FSSM containers` (`native.rs`; the geometry containers need
+  it) and `Shaders: translate single-stream triangle geometry programs`
+  (new `geometry.rs`; the geometry stage reaches DXIL as a geometry
+  shader, with the console's copy vertex shader traced for what each
+  vertex holds). Counted offline over the title's shaders: 195 `Gs`
+  programs that stopped at `an address in an SGPR that is no root
+  parameter` validate, and no other program changes. Other stages take
+  the same path as before (checked in an independent review). Two known
+  limits from that review: a container with a geometry slot or an
+  uncompressed entry that does not parse now fails as a whole, where the
+  slot or entry was skipped before; and every vertex pipeline's stream
+  now names an empty geometry shader, which should be the same pipeline
+  to Direct3D. Not run in the title: nothing is known yet about what
+  these programs draw there. A third commit offered with them (leave a
+  lane mask's dword undefined at a data join) is **not** in the tree:
+  it turned refusals into modules by handing out an undefined value
+  where the console uses the mask's value.
+- **A level-of-detail query passes its spatial coordinates only**
+  (`emit/lower.rs`; the fix is MichaelSmithAI's, from #453's
+  discussion): `image_get_lod` of an array texture passed the slice as a
+  coordinate and `dxil.dll` refused the module. A test for a 1D-array
+  and a 2D-array query fails without it. The 3 pixel programs of the
+  title that hit it validate now.
 
 ## Left out on purpose
 
@@ -580,7 +713,8 @@ Please include:
   pipeline refusal**, with the shader hash from the log.
 - **Whether the world shows geometry**, in words.
 - **The variables you set**: `VICTORY_SHADER_LOOP_LIMIT`,
-  `VICTORY_SKIP_WAVE64`, `VICTORY_NO_WATCHDOG`, `VICTORY_ROOT_SRV_DIRECT`.
+  `VICTORY_SKIP_WAVE64`, `VICTORY_NO_WATCHDOG`, `VICTORY_ROOT_SRV_DIRECT`,
+  `VICTORY_HEAP_GUARD`.
 - **These log lines, if they appear**: `a root SRV not on 16 bytes reads
   zeros`, `a root SRV without a bound view heap`, `title slot past the
   host heap` (with its highest index), and the `dropped=` count of
