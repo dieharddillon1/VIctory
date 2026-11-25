@@ -1728,6 +1728,35 @@ impl Shadow {
         }
     }
 
+
+    #[cfg(test)]
+    pub(crate) fn compact_test_copy(
+        host: &crate::host::Host,
+        title: &[u8],
+    ) -> (Arc<Self>, usize) {
+        let size = title.len() as u64;
+        let (staging, data) = host.shared_buffer(size).expect("WARP staging");
+        let buffer = host.uav_buffer(size).expect("WARP card buffer");
+        // SAFETY: the test's mapped staging buffer holds the exact size,
+        // and no test work can use it until the fixture is handed out.
+        let gpu = unsafe {
+            std::ptr::copy_nonoverlapping(title.as_ptr(), data, title.len());
+            buffer.GetGPUVirtualAddress()
+        };
+        let mut shadow = Self::new(buffer, data, gpu, title.as_ptr() as u64, size);
+        shadow.card = Some(Card {
+            staging, before: Mutex::default(), dirty: Mutex::default(),
+            sent: Mutex::default(), size,
+        });
+        (Arc::new(shadow), data as usize)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compact_test_note_send(&self, from: usize, to: usize, number: u64) {
+        self.card.as_ref().unwrap().sent.lock().unwrap().push((from, to, number));
+    }
+
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);

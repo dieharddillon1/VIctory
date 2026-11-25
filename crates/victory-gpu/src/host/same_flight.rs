@@ -1,3 +1,9 @@
+mod compact;
+mod compact_alias;
+pub(super) use compact_alias::AliasGuard;
+#[cfg(test)]
+mod compact_probe;
+
 use super::{
     CARD_WORK, COPY_BACK, CardPlan, CardWork, Host, QUEUE_ORDER, copy_fetch_runs, flagged_pieces,
 };
@@ -27,12 +33,21 @@ fn mode() -> u8 {
     *MODE.get_or_init(|| match std::env::var("VICTORY_SAME_FLIGHT_READBACK").as_deref() {
         Ok("1") => 1,
         Ok("2") => 2,
+        Ok("3") if crate::inplace::level() == 0 => 3,
+        Ok("3") => {
+            tracing::warn!("compact same-flight readback needs declared writes; using legacy relay with in-place title memory");
+            0
+        }
         _ => 0,
     })
 }
 
 pub(super) fn enabled() -> bool {
     mode() != 0
+}
+
+pub(super) fn compact_active() -> bool {
+    mode() == 3
 }
 
 fn can_defer_empty_retirement(sent: u64, retired: u64) -> bool {
@@ -43,7 +58,7 @@ fn can_defer_empty_retirement(sent: u64, retired: u64) -> bool {
 // history available to earlier snapshots. A real fetch always invalidates
 // them, as does hitting the bounded retention limit.
 pub(super) fn retire_empty(sent: u64) {
-    if mode() == 2 && can_defer_empty_retirement(sent, crate::shadow::relay_retired()) {
+    if mode() >= 2 && can_defer_empty_retirement(sent, crate::shadow::relay_retired()) {
         return;
     }
     retire_legacy_history();
@@ -85,24 +100,47 @@ pub(super) struct Snapshot {
     pieces: Vec<Piece>,
     bytes: u64,
     order: Option<Order>,
+    compact: Option<compact::Capture>,
 }
 
 #[derive(Default)]
 pub(super) struct Pool {
     buffers: Vec<ID3D12Resource>,
     active: usize,
+    compact: compact::Pool,
 }
 
 impl Pool {
     pub(super) fn retire(&mut self, snapshot: Snapshot) {
-        self.buffers.push(snapshot.buffer);
-        self.active -= 1;
+        if let Some(capture) = snapshot.compact {
+            self.compact.retire(snapshot.buffer, capture);
+        } else {
+            self.buffers.push(snapshot.buffer);
+            self.active -= 1;
+        }
     }
 }
 
 /// Captures a bounded plan before its own fence. Wide mode also captures
 /// ranges without comparisons, which always require a CPU merge.
-pub(super) fn prepare(host: &Host, work: &mut CardWork, plan: &mut CardPlan) {
+pub(super) fn prepare(host: &Host, work: &mut CardWork, plan: &mut CardPlan, alias: Option<&AliasGuard>) {
+    if compact_active() {
+        if plan.ranges.is_empty() {
+            return;
+        }
+        if alias.is_none_or(AliasGuard::blocked) {
+            compact::rejected(compact::Reject::Alias);
+            return;
+        }
+        match compact::prepare(host, work, plan) {
+            Ok((snapshot, list)) => {
+                plan.snapshot = Some(snapshot);
+                plan.lists.push((true, list));
+            }
+            Err(reason) => compact::rejected(reason),
+        }
+        return;
+    }
     let wide = mode() == 2;
     let limits = if wide { &WIDE } else { &SMALL };
     if work.snapshots.active >= limits.slots
@@ -161,6 +199,7 @@ pub(super) fn prepare(host: &Host, work: &mut CardWork, plan: &mut CardPlan) {
         pieces,
         bytes,
         order: None,
+        compact: None,
     });
     plan.lists.push((true, copy));
     work.snapshots.active += 1;
@@ -207,7 +246,11 @@ pub(super) fn execute(
         queue.ExecuteCommandLists(&[Some(snapshot.list.clone())]);
         queue.Signal(fence, target)?;
     }
-    STATS[0].fetch_add(snapshot.bytes, Ordering::Relaxed);
+    if snapshot.compact.is_some() {
+        compact::submitted();
+    } else {
+        STATS[0].fetch_add(snapshot.bytes, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -220,22 +263,18 @@ pub(super) fn merge(plan: &CardPlan) -> bool {
         return false;
     };
     if !order.still_valid(LEGACY_EPOCH.load(Ordering::Relaxed))
-        || (mode() == 2 && order.sent < crate::shadow::relay_retired())
+        || (mode() >= 2 && order.sent < crate::shadow::relay_retired())
     {
-        STATS[3].fetch_add(1, Ordering::Relaxed);
+        if snapshot.compact.is_some() {
+            compact::rejected(compact::Reject::Order);
+        } else {
+            STATS[3].fetch_add(1, Ordering::Relaxed);
+        }
         return false;
     }
-    let differs = {
-        let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        work.as_ref()
-            .map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
-    };
-    let Some((differs, dwords)) = differs else {
+    let Some(differs) = compare_words() else {
         return false;
     };
-    // SAFETY: the flight fence is complete and its flag slots cannot be
-    // reused until the caller retires this plan.
-    let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
     let flags: Vec<_> = snapshot
         .pieces
         .iter()
@@ -296,7 +335,70 @@ pub(super) fn merge(plan: &CardPlan) -> bool {
     true
 }
 
+/// A landing either reapplies every captured declaration in queue order or
+/// uses the legacy fetch for all of them. In particular, a fallback must
+/// not move an older write behind a newer compact merge through alias VAs.
+pub(super) fn merge_compact_batch(plans: &[(&CardPlan, Option<&AliasGuard>)]) -> bool {
+    let active: Vec<_> = plans.iter().filter(|(plan, _)| !plan.ranges.is_empty()).collect();
+    if active.is_empty() {
+        let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        retire_empty(*order);
+        return true;
+    }
+    if active.iter().any(|(plan, _)| plan.snapshot.is_none()) {
+        compact::rejected(compact::Reject::Landing);
+        return false;
+    }
+    let Some(flags) = compare_words() else {
+        compact::rejected(compact::Reject::Host);
+        return false;
+    };
+    let merged = AliasGuard::with_all_clear(active.iter().map(|(_, guard)| *guard), || {
+        let staged = active.iter().map(|(plan, _)| {
+            let snapshot = plan.snapshot.as_ref().ok_or(compact::Reject::Landing)?;
+            let order = snapshot.order.ok_or(compact::Reject::Order)?;
+            if !order.still_valid(LEGACY_EPOCH.load(Ordering::Relaxed))
+                || order.sent < crate::shadow::relay_retired()
+            {
+                return Err(compact::Reject::Order);
+            }
+            let capture = snapshot.compact.as_ref().ok_or(compact::Reject::Landing)?;
+            let valid = compact::validate(capture, flags)?;
+            Ok((*plan, capture, order, valid))
+        }).collect::<Result<Vec<_>, compact::Reject>>();
+        match staged {
+            Ok(staged) => {
+                for (plan, capture, order, valid) in staged {
+                    compact::merge(capture, plan, order, valid);
+                }
+                true
+            }
+            Err(reason) => {
+                compact::rejected(reason);
+                false
+            }
+        }
+    });
+    merged.unwrap_or_else(|| {
+        compact::rejected(compact::Reject::Alias);
+        false
+    })
+}
+
+fn compare_words() -> Option<&'static [u32]> {
+    let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+    let work = work.as_ref()?;
+    // SAFETY: CardWork keeps this mapping for the process. The caller only
+    // examines its waited plans' flag slots before their retirement.
+    Some(unsafe { std::slice::from_raw_parts(work.differs.1 as *const u32, (work.differs.2 / 4) as usize) })
+}
+
+
 pub(super) fn report(frames: f64) {
+    if compact_active() {
+        compact::report(frames);
+        return;
+    }
     let [sent, plans, consumed, stale] = STATS.each_ref().map(|s| s.swap(0, Ordering::Relaxed));
     tracing::info!(
         "same-flight readback per frame: {:.1} plans, {:.1} MB used of {:.1} MB copied; {:.1} plans overtaken by a legacy fetch",
@@ -371,7 +473,7 @@ mod tests {
         resource.unwrap()
     }
 
-    fn prelude(device: &ID3D12Device) -> super::super::Prelude {
+    pub(super) fn prelude(device: &ID3D12Device) -> super::super::Prelude {
         // SAFETY: these objects are new and live through the test.
         unsafe {
             let allocator = device
@@ -385,7 +487,7 @@ mod tests {
         }
     }
 
-    fn fill(resource: &ID3D12Resource, bytes: &[u8]) {
+    pub(super) fn fill(resource: &ID3D12Resource, bytes: &[u8]) {
         let mut data = std::ptr::null_mut();
         // SAFETY: this is an upload buffer and is not on the queue yet.
         unsafe {
@@ -477,6 +579,7 @@ mod tests {
                 pieces: Vec::new(),
                 bytes: 24,
                 order: None,
+                compact: None,
             }
         };
         let record_write = |p: &super::super::Prelude, src, dest_at, bytes| -> ID3D12CommandList {

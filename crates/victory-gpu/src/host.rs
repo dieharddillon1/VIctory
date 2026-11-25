@@ -1944,6 +1944,7 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    compact_alias: Option<same_flight::AliasGuard>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -1959,6 +1960,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    compact_alias: Option<same_flight::AliasGuard>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -3017,7 +3019,7 @@ impl Host {
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    fn card_before(&self, runs: &[&HostList], flown: bool, compact_alias: Option<&same_flight::AliasGuard>) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -3227,7 +3229,7 @@ impl Host {
             plan.lists.push((true, check));
         }
         if flown && same_flight::enabled() {
-            same_flight::prepare(self, work, &mut plan);
+            same_flight::prepare(self, work, &mut plan, compact_alias);
         }
         work.out += 1;
         Some(plan)
@@ -3439,17 +3441,23 @@ impl Host {
                         last_notes(&runs)
                     ));
                 }
-                let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
-                if same_flight::enabled() {
+                let plans: Vec<_> = flights.iter().filter_map(|f| f.card.as_ref().map(|plan| (plan, f.compact_alias.as_ref()))).collect();
+                if same_flight::compact_active() {
+                    if !same_flight::merge_compact_batch(&plans) {
+                        let legacy: Vec<_> = plans.iter().map(|(plan, _)| *plan).collect();
+                        self.relay_card_back(&legacy, fetch);
+                    }
+                } else if same_flight::enabled() {
                     // Exact snapshots land first, in queue order. A legacy
                     // fetch can see newer data, so it must merge last.
-                    let fallback: Vec<_> = plans.iter().copied()
-                        .filter(|plan| !same_flight::merge(plan))
+                    let fallback: Vec<_> = plans.iter()
+                        .filter_map(|(plan, _)| (!same_flight::merge(plan)).then_some(*plan))
                         .collect();
                     if !fallback.is_empty() {
                         self.relay_card_back(&fallback, fetch);
                     }
                 } else {
+                    let plans: Vec<_> = plans.iter().map(|(plan, _)| *plan).collect();
                     self.relay_card_back(&plans, fetch);
                 }
                 let mut back: Vec<Declared> = Vec::new();
@@ -3711,6 +3719,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                compact_alias: sent.compact_alias,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -3755,6 +3764,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                compact_alias: sent.compact_alias,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -3967,6 +3977,10 @@ impl Host {
         // lists that may read them run.
         crate::descriptor::make_waiting();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        // Register before deferred title writes and GPU work. A distinct
+        // owner overlapping an active capture must invalidate that capture.
+        let compact_alias = (late && relay() && same_flight::compact_active())
+            .then(|| same_flight::AliasGuard::register(this_submission, runs));
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -4044,7 +4058,7 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let mut card = self.card_before(runs, flown);
+        let mut card = self.card_before(runs, flown, compact_alias.as_ref());
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -4075,6 +4089,7 @@ impl Host {
                 card,
                 back,
                 writes,
+                compact_alias,
             };
             working(was_working);
             return Some((submitted, sent));
