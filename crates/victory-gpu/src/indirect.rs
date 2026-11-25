@@ -27,6 +27,9 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
+#[cfg(feature = "diagnostics")]
+pub(crate) mod profile;
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
@@ -269,7 +272,11 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    record_clamp_as(
+        c, &list.list, &dst, budget, src, count, spec, 0,
+        #[cfg(feature = "diagnostics")]
+        Some(list),
+    ).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -289,7 +296,11 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, AHEAD).then_some(dst)
+    record_clamp_as(
+        c, &list.list, &dst, budget, src, None, spec, AHEAD,
+        #[cfg(feature = "diagnostics")]
+        Some(list),
+    ).then_some(dst)
 }
 
 /// The parts [`bound_split`] makes of a dispatch, the most groups of each,
@@ -311,13 +322,18 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
     validate_layout(spec, src.1, None)?;
     let (c, budget) = (clamp()?, list.budget()?);
     let dst = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, IN_PARTS).then_some(dst)
+    record_clamp_as(
+        c, &list.list, &dst, budget, src, None, spec, IN_PARTS,
+        #[cfg(feature = "diagnostics")]
+        Some(list),
+    ).then_some(dst)
 }
 
 /// Bits of the clamp's `has_count`.
 const AHEAD: u32 = 2;
 const IN_PARTS: u32 = 4;
 
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -327,7 +343,11 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, 0)
+    record_clamp_as(
+        c, l, dst, budget, src, count, spec, 0,
+        #[cfg(feature = "diagnostics")]
+        None,
+    )
 }
 
 /// [`record_clamp`]; `how`: [`AHEAD`], the records are a window clamped
@@ -343,6 +363,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     how: u32,
+    #[cfg(feature = "diagnostics")] profiled_list: Option<&HostList>,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -417,6 +438,14 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    #[cfg(feature = "diagnostics")]
+    let sample = profiled_list.and_then(|list| profile::ListProfile::sample(list, kind, records));
+    #[cfg(feature = "diagnostics")]
+    let stamp = |phase| {
+        if let Some(sample) = &sample { sample.stamp(l, phase); }
+    };
+    #[cfg(feature = "diagnostics")]
+    stamp(0);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -428,10 +457,16 @@ fn record_clamp_as(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
+            #[cfg(feature = "diagnostics")]
+            stamp(1);
             l.Dispatch(records.div_ceil(64), 1, 1);
+            #[cfg(feature = "diagnostics")]
+            stamp(2);
         }
         l.ResourceBarrier(&second[skip..]);
     }
+    #[cfg(feature = "diagnostics")]
+    stamp(3);
     true
 }
 
@@ -1043,6 +1078,8 @@ void main() {
                 None,
                 (2, 12, 1),
                 IN_PARTS,
+                #[cfg(feature = "diagnostics")]
+                None,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list and live buffers.
@@ -1096,6 +1133,8 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 if ahead { AHEAD } else { 0 },
+                #[cfg(feature = "diagnostics")]
+                None,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.

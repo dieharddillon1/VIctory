@@ -126,6 +126,11 @@ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u
 // The prison scene after the initial cutscene and shader-cache warmup.
 static WARM_SCENE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn warm_scene() -> u64 {
+    WARM_SCENE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;

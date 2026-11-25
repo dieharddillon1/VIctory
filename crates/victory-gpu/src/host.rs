@@ -769,6 +769,8 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) indirect_profile: Mutex<Option<crate::indirect::profile::ListProfile>>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -2688,7 +2690,20 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// ([`late`]) did not, at any stage: the flights' lists were settled
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
-fn read_backs(list: &HostList) {
+fn read_backs(list: &HostList, submission: u64) {
+    #[cfg(feature = "diagnostics")]
+    if crate::indirect::profile::capturing()
+        && let Some(profile) = list.indirect_profile.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+    {
+        static FREQUENCY: OnceLock<u64> = OnceLock::new();
+        let frequency = *FREQUENCY.get_or_init(|| {
+            // SAFETY: a plain read of the direct queue's clock frequency.
+            host().and_then(|h| unsafe { h.queue.GetTimestampFrequency() }.ok()).unwrap_or(0)
+        });
+        profile.report(std::ptr::from_ref(list) as usize, submission, frequency);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = submission;
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -2888,6 +2903,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                indirect_profile: Mutex::new(None),
             })
         }
     }
@@ -3494,7 +3511,7 @@ impl Host {
                 Late::Run(flight) => {
                     last = flight.number;
                     for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
+                        read_backs(flight.lists[i].host(), flight.number);
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -3896,7 +3913,7 @@ impl Host {
                     Late::Run(flight) => {
                         last = flight.number;
                         for &i in &flight.order {
-                            read_backs(flight.lists[i].host());
+                            read_backs(flight.lists[i].host(), flight.number);
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
@@ -4218,7 +4235,7 @@ impl Host {
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
-            read_backs(list);
+            read_backs(list, this_submission);
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -4494,6 +4511,12 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
+        if crate::indirect::profile::capturing()
+            && let Some(profile) = self.indirect_profile.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        {
+            profile.resolve(&self.list);
+        }
+        #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
@@ -4522,6 +4545,10 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        if crate::indirect::profile::capturing() {
+            self.indirect_profile.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
