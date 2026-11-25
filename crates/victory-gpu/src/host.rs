@@ -1450,6 +1450,55 @@ fn copy_fetch_runs<R: Copy + PartialEq>(
     count
 }
 
+/// One GPU transfer for several slices of a single backing. The original
+/// pieces keep their order for CPU merge and point into this transfer.
+#[derive(Debug, PartialEq, Eq)]
+struct PackedFetch {
+    piece: usize,
+    from: usize,
+    to: usize,
+    offset: u64,
+}
+
+fn pack_relay_fetches<T>(
+    pieces: &mut [(T, usize, usize, u64)],
+    owner: impl Fn(&T) -> usize,
+) -> (Vec<PackedFetch>, u64) {
+    let mut order: Vec<_> = pieces
+        .iter()
+        .enumerate()
+        .map(|(i, (source, from, _, _))| (owner(source), *from, i))
+        .collect();
+    order.sort_unstable();
+    let mut spans: Vec<PackedFetch> = Vec::new();
+    let mut previous = None;
+    let mut total = 0;
+    for (key, from, piece) in order {
+        let (_, _, to, offset) = &mut pieces[piece];
+        if let Some(span) = spans.last_mut()
+            && previous == Some(key)
+            && from <= span.to
+        {
+            *offset = span.offset + (from - span.from) as u64;
+            if *to > span.to {
+                total += (*to - span.to) as u64;
+                span.to = *to;
+            }
+        } else {
+            *offset = total;
+            spans.push(PackedFetch {
+                piece,
+                from,
+                to: *to,
+                offset: total,
+            });
+            total += (*to - from) as u64;
+            previous = Some(key);
+        }
+    }
+    (spans, total)
+}
+
 mod same_flight;
 
 /// What the host keeps for copies in the card's own memory, including
@@ -3343,7 +3392,6 @@ impl Host {
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
@@ -3370,8 +3418,7 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                            pieces.push((r.shadow.clone(), lo, hi, 0));
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -3384,6 +3431,15 @@ impl Host {
             same_flight::retire_empty(*order);
             return;
         }
+        let uncombined = pieces.iter().map(|(_, lo, hi, _)| (*hi - *lo) as u64).sum::<u64>();
+        let (packed, total) = pack_relay_fetches(&mut pieces, |shadow| std::sync::Arc::as_ptr(shadow) as usize);
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::warm_scene() != 0 && crate::queue::presented().saturating_sub(crate::capture::warm_scene()) <= 40 {
+            tracing::info!(pieces = pieces.len(), transfers = packed.len(), uncombined, packed_bytes = total,
+                "packed relay transfers");
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = uncombined;
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }
@@ -3407,8 +3463,9 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                for span in &packed {
+                    let source = &pieces[span.piece].0.buffer;
+                    list.CopyBufferRegion(&buffer, span.offset, source, span.from as u64, (span.to - span.from) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
