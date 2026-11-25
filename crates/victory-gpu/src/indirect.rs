@@ -182,13 +182,42 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_from_source(device, SOURCE)
+}
+
+/// The common one-record case runs one thread and uses the regular shader
+/// body, including the count buffer, the saturating budget, and split dispatch.
+fn single_record_clamp() -> Option<&'static Clamp> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_SINGLE_THREAD").is_some_and(|v| v == "1")) {
+        return None;
+    }
+    static SINGLE: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    SINGLE.get_or_init(|| {
+        let device = &host()?.device;
+        match make_single_for(device) {
+            Ok(clamp) => Some(clamp),
+            Err(error) => {
+                tracing::warn!(%error, "single-record validator unavailable; using regular validator");
+                None
+            }
+        }
+    }).as_ref()
+}
+
+fn make_single_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    let source = SOURCE.replace("[numthreads(64, 1, 1)]", "[numthreads(1, 1, 1)]");
+    make_from_source(device, &source)
+}
+
+fn make_from_source(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -450,6 +479,7 @@ fn record_clamp_as(
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
         if records > 0 {
+            let c = if records == 1 { single_record_clamp().unwrap_or(c) } else { c };
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -1049,6 +1079,13 @@ void main() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
+        let single = make_single_for(&warp.device).expect("single-record validator");
+        run_split_dispatch_cases(&mut warp, &single);
+        let regular = make_for(&warp.device).expect("regular validator");
+        run_split_dispatch_cases(&mut warp, &regular);
+    }
+
+    fn run_split_dispatch_cases(warp: &mut WarpHarness, clamp: &Clamp) {
         let cases: [([u32; 3], [u32; 6]); 6] = [
             ([115_200, 1, 1], [65_535, 1, 1, 49_665, 1, 1]),
             ([65_535, 1, 1], [65_535, 1, 1, 0, 1, 1]),
@@ -1070,7 +1107,7 @@ void main() {
                 std::ptr::write_bytes(readback_ptr, 0, 64);
             }
             assert!(record_clamp_as(
-                &warp.clamp,
+                clamp,
                 &warp.list,
                 &dst_buf,
                 budget_gpu,
