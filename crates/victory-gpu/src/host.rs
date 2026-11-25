@@ -2089,6 +2089,28 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Capture the exact CPU reads that overlap declared GPU writes in a short
+/// warm-scene window. Querying the journal or changing scheduling here
+/// would perturb the dependency this diagnostic is trying to observe.
+#[cfg(feature = "diagnostics")]
+fn trace_read_hazard(kind: &str, source: usize, bytes: usize, writes: &[(usize, usize)]) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_TRACE_READ_HAZARDS").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let frame = crate::queue::presented();
+    let warm = crate::capture::warm_scene();
+    if warm == 0 || frame.saturating_sub(warm) > 40 {
+        return;
+    }
+    let end = source.saturating_add(bytes);
+    if let Some(&(first, last)) = writes.iter().find(|&&(first, last)| first < end && source < last) {
+        tracing::info!(frame, kind, source = format_args!("{source:#x}"), bytes,
+            write_start = format_args!("{first:#x}"), write_bytes = last - first,
+            "CPU title read overlaps a pending GPU write declaration");
+    }
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2103,6 +2125,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            trace_read_hazard("copy", src, len, written);
                         }
                         return Some(WHY_READ);
                     }
@@ -2111,6 +2135,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            trace_read_hazard("fill", src, len, written);
                         }
                         return Some(WHY_READ);
                     }
