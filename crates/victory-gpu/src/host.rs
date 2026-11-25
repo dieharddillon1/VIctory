@@ -1499,6 +1499,19 @@ fn pack_relay_fetches<T>(
     (spans, total)
 }
 
+#[cfg(test)]
+#[test]
+fn packing_reuses_gpu_bytes_without_reordering_cpu_pieces() {
+    let mut pieces = [(2usize, 16, 28, 0), (1, 8, 12, 0), (2, 4, 20, 0), (2, 28, 32, 0)];
+    let (packed, bytes) = pack_relay_fetches(&mut pieces, |owner| *owner);
+    assert_eq!(bytes, 32);
+    assert_eq!(packed, [
+        PackedFetch { piece: 1, from: 8, to: 12, offset: 0 },
+        PackedFetch { piece: 2, from: 4, to: 32, offset: 4 },
+    ]);
+    assert_eq!(pieces, [(2, 16, 28, 16), (1, 8, 12, 0), (2, 4, 20, 4), (2, 28, 32, 28)]);
+}
+
 mod same_flight;
 
 /// What the host keeps for copies in the card's own memory, including
