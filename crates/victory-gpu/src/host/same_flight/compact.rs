@@ -78,8 +78,17 @@ use windows::core::{Interface, s};
 
 const HEADER: usize = 16;
 const TAG: u32 = 0x877b2ac1;
-const CAPACITY: usize = 16 << 20;
-const MAX_SLOTS: usize = 6;
+/// A larger readback pool for measuring the fallback cost in busy scenes.
+fn pool_limits() -> (usize, usize) {
+    static LIMITS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        if std::env::var_os("VICTORY_COMPACT_LARGE_POOL").is_some_and(|value| value == "1") {
+            (32 << 20, 12)
+        } else {
+            (16 << 20, 6)
+        }
+    })
+}
 const MAX_ROWS: usize = 2048;
 const MAX_PIECES: usize = 8192;
 const MAX_GROUPS: usize = 32;
@@ -287,7 +296,7 @@ impl Layout {
         }
         let size = word(output, 0).ok_or(Reject::Integrity)? as usize;
         let expected = word(output, 8).ok_or(Reject::Integrity)? as usize;
-        if size > CAPACITY {
+        if size > pool_limits().0 {
             return Err(Reject::Overflow);
         }
         let mut rows = output.get(HEADER..HEADER + size).ok_or(Reject::Integrity)?;
@@ -374,7 +383,7 @@ impl Pool {
         // SAFETY: card_done is after this flight's fence. The header is
         // available even on overflow and when the CPU used legacy fallback.
         let header = unsafe { std::slice::from_raw_parts(capture.data as *const u8, HEADER) };
-        let payload = u64::from(word(header, 8).unwrap_or(0)).min(CAPACITY as u64);
+        let payload = u64::from(word(header, 8).unwrap_or(0)).min(pool_limits().0 as u64);
         GPU_PAYLOAD.fetch_add(payload, Relaxed);
         self.buffers.push((buffer, capture.data));
         self.active -= 1;
@@ -392,7 +401,7 @@ pub(super) fn prepare(
     work: &mut CardWork,
     plan: &CardPlan,
 ) -> Result<(Snapshot, super::super::Prelude), Reject> {
-    if work.snapshots.compact.active == MAX_SLOTS {
+    if work.snapshots.compact.active >= pool_limits().1 {
         return Err(Reject::Pool);
     }
     let flag_words = u32::try_from(work.differs.2 / 4).map_err(|_| Reject::Bounds)?;
@@ -445,7 +454,7 @@ pub(super) fn prepare(
             .ok_or(Reject::Host)?,
     );
     let pick = pool.buffers.pop().or_else(|| {
-        host.shared_buffer((HEADER + CAPACITY) as u64)
+        host.shared_buffer((HEADER + pool_limits().0) as u64)
             .map(|(buffer, ptr)| (buffer, ptr as usize))
     });
     let Some((buffer, mapping)) = pick.filter(|&(_, ptr)| ptr != 0 && !upload_ptr.is_null()) else {
@@ -484,7 +493,7 @@ pub(super) fn prepare(
                     group.width,
                     flag_words,
                     layout.rows.len() as u32,
-                    CAPACITY as u32,
+                    pool_limits().0 as u32,
                     refs,
                     group.first,
                 ];
@@ -529,9 +538,9 @@ pub(super) struct Validated<'a> {
 
 pub(super) fn validate<'a>(capture: &'a Capture, flags: &[u32]) -> Result<Validated<'a>, Reject> {
     // SAFETY: this flight's fence has completed and the slot is not yet
-    // retired. The backing allocation is HEADER+CAPACITY in every slot.
+    // retired. Every slot uses the same process-wide capacity.
     let output =
-        unsafe { std::slice::from_raw_parts(capture.data as *const u8, HEADER + CAPACITY) };
+        unsafe { std::slice::from_raw_parts(capture.data as *const u8, HEADER + pool_limits().0) };
     let records = capture.layout.validate(output, flags)?;
     Ok(Validated {
         records,
