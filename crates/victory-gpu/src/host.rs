@@ -1448,8 +1448,6 @@ fn copy_fetch_runs<R: Copy + PartialEq>(
     count
 }
 
-static FETCH_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 mod same_flight;
 
 /// What the host keeps for copies in the card's own memory, including
